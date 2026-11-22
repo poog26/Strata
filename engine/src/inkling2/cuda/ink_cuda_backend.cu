@@ -121,19 +121,26 @@ public:
         if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
             kv_dtype_ = KvDtype::FP8_E4M3;
         }
-        const int eff_chunk = std::max(64, opts.chunk);
+        const bool tight_8gb = (prop.totalGlobalMem <= (10ull << 30)) && (max_slots_ <= 2);
+        const int eff_chunk = tight_8gb ? std::max(64, std::min(opts.chunk, 256)) : std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
         const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
         const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
+        const size_t target_ctx = (size_t)std::max(256, opts.max_ctx);
         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
-                                  + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
+                                  + (size_t)8 * max_slots_ * target_ctx * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                             : tight_8gb                              ? (210ull << 20)
                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
                                                                       : (320ull << 20));
-        const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
+        size_t min_reserve_bytes = min_kv_bytes + ws_pad;
+        if (opts.vram_reserve_mib >= 0) {
+            // Explicit --vram-reserve-mib adds user-chosen free VRAM cushion on top of exact KV+workspace footprint
+            min_reserve_bytes = min_kv_bytes + ws_pad + ((size_t)opts.vram_reserve_mib << 20);
+        }
 
         // Load .strata v1.1 trunk + experts (100% VRAM or 3x loop-weighted vram_load_order!)
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
@@ -144,7 +151,7 @@ public:
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         runner_->use_cuda_graph = true;
-        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd);
+        runner_->init(max_slots_, std::max(256, opts.max_ctx), eff_chunk, cuda_kvd);
         eff_max_ctx_ = runner_->max_ctx;
 
         if (opts.enable_dspark && model_.man.has_dspark) {
@@ -492,7 +499,14 @@ public:
         // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3,4,5,6,8,10,12})!
         strata::ink::InkTreeSpec tr{};
         const int max_nodes = std::min(12, runner_->tree_cap);
-        dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/4.2f);
+        float moe_ratio = (model_.n_host_experts > 0) ? 9.0f : 4.2f;
+        if (model_.n_host_experts > 0) {
+            if (const char* er = std::getenv("STRATA_HYB_MOE_RATIO"); er && *er) {
+                float v = std::strtof(er, nullptr);
+                if (v > 0.5f && v < 100.0f) moe_ratio = v;
+            }
+        }
+        dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/moe_ratio);
 
         // 3. Single CUDA-Graph 48-visit tree verify + exact GPU screened argmax (ZERO 6.4 MB logits D2H!)
         runner_->forward_tree_verify(tr, anchor_pos, 0, true);

@@ -182,6 +182,7 @@ struct InkCudaModel {
         // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 (even under Win11 WDDM!) and SQ-15 in 16 GB RTX 5070 Ti,
         // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
         const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
+                                  : (vtot <= (10ull << 30)) ? (extra_reserve_bytes > 0 ? 0ull : (420ull << 20))
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
                                                             : (1280ull << 20);
         const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
@@ -214,9 +215,17 @@ struct InkCudaModel {
                 order.resize(n_total);
                 for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
             }
-            // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
-            const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
-            const size_t hyb_reserve = hyb_post_res + (256ull << 20);
+            // Exact context-aware hybrid reserve on <=10 GiB GPUs (zero arbitrary free-VRAM floor!):
+            // `reserve` already includes exact SWA + target global KV + DSpark + workspaces!
+            const size_t post_floor = (vtot <= (10ull << 30)) ? 0ull : (1664ull << 20);
+            const size_t hyb_post_res = std::max(reserve, post_floor);
+            size_t promo_budget = 256ull << 20;
+            if (const char* pe = std::getenv("STRATA_PROMO_MIB"); pe && *pe) {
+                int mb = std::atoi(pe);
+                promo_budget = (mb <= 0) ? 0 : ((size_t)mb << 20);
+            }
+            const size_t stage_budget = ((vtot <= (10ull << 30)) ? (64ull << 20) : (144ull << 20)) + promo_budget;
+            const size_t hyb_reserve = hyb_post_res + stage_budget;
             const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
@@ -522,7 +531,9 @@ struct InkCudaRunner {
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20)
+                                      : (max_slots == 1 && max_batch <= 256) ? (160ull << 20)
+                                                                             : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
                 const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
@@ -1459,8 +1470,9 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_tok_ids, slot_buf, (size_t)M * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, h_pos, (size_t)M * 4, cudaMemcpyHostToDevice, st));
 
-        // Use CUDA Graph for single-token / small-M decode!
-        if (use_cuda_graph && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0) {
+        // Use CUDA Graph for single-token / small-M decode (skip capture when host DMA streaming runs on M=1)!
+        if (use_cuda_graph && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0 &&
+            (m.n_host_experts == 0 || m.hybrid.use_doorbell_m1)) {
             GraphKey key{M, 0, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -1478,7 +1490,10 @@ struct InkCudaRunner {
             return;
         }
         emit_48_visits(M, 0, slot0, p0, want_taps);
-        if (M == 1 && m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
+        if (M == 1 && m.hybrid.active && m.n_host_experts > 0) {
+            if (m.hybrid.use_doorbell_m1) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
+            else m.hybrid.step_promote_host(m.d_sec4, m.d_experts, st);
+        }
     }
 
     // Speculative Tree-32 / Block-8 verify (100% CUDA-Graph capturable across ALL p0 when 100% VRAM!)
@@ -1519,6 +1534,9 @@ struct InkCudaRunner {
             return;
         }
         emit_48_visits(M, 2, slot0, p0, want_taps);
+        if (m.hybrid.active && m.n_host_experts > 0) {
+            m.hybrid.step_promote_host(m.d_sec4, m.d_experts, st);
+        }
     }
 
     // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)
@@ -1531,7 +1549,7 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && B <= 64 && (m.n_host_experts == 0 || B == 1)) {
+        if (use_cuda_graph && B <= 64 && (m.n_host_experts == 0 || (B == 1 && m.hybrid.use_doorbell_m1))) {
             GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
