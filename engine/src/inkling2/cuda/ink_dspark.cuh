@@ -57,8 +57,10 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps(
     const float* __restrict__ fuse_w,  // [4, 4] F32
     int row,
     const float* __restrict__ norm_w,  // [2304] F32
-    float* __restrict__ out,           // [M, 2304]
-    int M) {
+    float* __restrict__ out,           // [M, 2304] or [ring_cap, 2304]
+    int M,
+    int ring_p0 = 0,
+    int ring_cap = 0) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int tid = threadIdx.x;
@@ -73,7 +75,8 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps(
     }
     __syncthreads();
     const size_t off = (size_t)m * kInkHidden;
-    float* dst = out + off;
+    const size_t dst_row = (ring_cap > 0) ? (size_t)((ring_p0 + m) % ring_cap) : (size_t)m;
+    float* dst = out + dst_row * kInkHidden;
     float ss = 0.0f;
     for (int d = tid; d < kInkHidden; d += 256) {
         float v = sw[0] * tap0[off + d] + sw[1] * tap1[off + d] + sw[2] * tap2[off + d] + sw[3] * tap3[off + d];
@@ -96,6 +99,7 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const int32_t* __restrict__ apos_ptr, // [1] committed context length
     bool is_swa,
     int swa_win,                          // 1025
+    int ctx_cap,                          // ring buffer capacity for ctx_k / ctx_v
     int B,                                // 8
     float* __restrict__ out) {            // [B, 24, 128]
     const int b = blockIdx.y;
@@ -110,7 +114,8 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float scale = 0.08838834764831845f;
 
     const float4 qv = *(const float4*)(q + ((size_t)b * kInkHeads + h) * kInkHeadDim + lane * 4);
-    const int c0 = is_swa ? max(0, apos - swa_win + 1) : 0;
+    int c0 = is_swa ? max(0, apos - swa_win + 1) : 0;
+    if (ctx_cap > 0) c0 = max(c0, apos - ctx_cap + 1);
 
     float mw = -1e30f, lw = 0.0f;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -128,7 +133,8 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     };
 
     for (int kp = c0 + warp; kp < apos; kp += 4) {
-        const size_t base = ((size_t)kp * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+        const int p_idx = (ctx_cap > 0) ? (kp % ctx_cap) : kp;
+        const size_t base = ((size_t)p_idx * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         const uint2 k2 = *(const uint2*)(ctx_k + base);
         const uint2 v2 = *(const uint2*)(ctx_v + base);
         const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
@@ -534,15 +540,18 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep(
     const int32_t* __restrict__ prev_tok_ptr,
     const float* __restrict__ state,      // [256]
     const float* __restrict__ hidden,     // [2304]
-    const float* __restrict__ f_rnn_base, // [max_ctx, 2304]
+    const float* __restrict__ f_rnn_base, // [f_rnn_cap, 2304]
     const int32_t* __restrict__ apos_ptr, // [1]
+    int f_rnn_cap,
     const uint8_t* __restrict__ mw1_raw, int mw1_fmt,
     float* __restrict__ joint_out) {      // [5120]
     constexpr int R = kInkMarkovRank;
     const int tid = threadIdx.x;
     const int32_t pt = *prev_tok_ptr;
     const int apos = *apos_ptr;
-    const float* ctx = f_rnn_base + (size_t)(apos > 0 ? (apos - 1) : 0) * kInkHidden;
+    const int r_pos = (apos > 0 ? (apos - 1) : 0);
+    const int r_idx = (f_rnn_cap > 0) ? (r_pos % f_rnn_cap) : r_pos;
+    const float* ctx = f_rnn_base + (size_t)r_idx * kInkHidden;
 
     joint_out[tid] = state[tid];
     float mv = 0.0f;
@@ -714,8 +723,9 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep_batch(
     const int32_t* __restrict__ prev_toks, // [nw]
     const float* __restrict__ states,      // [nw, 256]
     const float* __restrict__ hidden,      // [2304]
-    const float* __restrict__ f_rnn_base,  // [max_ctx, 2304]
+    const float* __restrict__ f_rnn_base,  // [f_rnn_cap, 2304]
     const int32_t* __restrict__ apos_ptr,  // [1]
+    int f_rnn_cap,
     const uint8_t* __restrict__ mw1_raw, int mw1_fmt,
     float* __restrict__ joint_out,         // [nw, 5120]
     int nw) {
@@ -726,7 +736,9 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep_batch(
     const int tid = threadIdx.x;
     const int32_t pt = prev_toks[b];
     const int apos = *apos_ptr;
-    const float* ctx = f_rnn_base + (size_t)(apos > 0 ? (apos - 1) : 0) * kInkHidden;
+    const int r_pos = (apos > 0 ? (apos - 1) : 0);
+    const int r_idx = (f_rnn_cap > 0) ? (r_pos % f_rnn_cap) : r_pos;
+    const float* ctx = f_rnn_base + (size_t)r_idx * kInkHidden;
     float* jo = joint_out + (size_t)b * J;
 
     jo[tid] = states[(size_t)b * R + tid];
@@ -1010,10 +1022,12 @@ struct InkDSpark {
     int max_ctx = 4096;
     int K_cand = 256;  // reduced-vocab L2-cached candidate pool for Markov RNN
 
-    // Context KV cache for 3 DSpark layers + f_rnn [max_ctx, 2304]
+    // Context KV cache for 3 DSpark layers (ring-buffered!) + f_rnn [f_rnn_cap, 2304]
     __half* d_ctx_k[3] = {};
     __half* d_ctx_v[3] = {};
-    float*  d_f_rnn = nullptr;  // [max_ctx, 2304]
+    int     ctx_cap[3] = {};
+    float*  d_f_rnn = nullptr;  // [f_rnn_cap, 2304]
+    int     f_rnn_cap = 0;
 
     // Working buffers for Block-8 forward
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
@@ -1080,11 +1094,15 @@ struct InkDSpark {
         if (!m.man.has_dspark) return;
         max_ctx = ctx;
         K_cand = k_cand;
+        // Ring-buffer DSpark's drafter KV & f_rnn so 100k-256k context costs ~36 MiB instead of 4+ GiB!
         for (int il = 0; il < 3; ++il) {
-            d_ctx_k[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
-            d_ctx_v[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
+            const bool swa = (m.man.c.dspark_is_swa[il] != 0);
+            ctx_cap[il] = std::min(max_ctx, swa ? 2048 : 4096);
+            d_ctx_k[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
+            d_ctx_v[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
         }
-        d_f_rnn = dalloc<float>((size_t)max_ctx * kInkHidden);
+        f_rnn_cap = std::min(max_ctx, 512);
+        d_f_rnn = dalloc<float>((size_t)f_rnn_cap * kInkHidden);
 
         const int B = kInkDsparkBlock;  // 8
         d_cur         = dalloc<float>(B * kInkHidden);
@@ -1341,15 +1359,16 @@ struct InkDSpark {
             InkKvVisitDesc desc{};
             desc.k_f16 = d_ctx_k[il];
             desc.v_f16 = d_ctx_v[il];
-            desc.cap_pos = max_ctx;
-            desc.is_swa = false;
+            desc.cap_pos = ctx_cap[il];
+            desc.is_swa = true;   // ring wrap p % ctx_cap[il]
             desc.is_fp8 = false;
+            desc.is_k4v4 = false;
             k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);
         }
         k_dspark_mix_taps<<<M, 256, 0, r.st>>>(
             taps[0], taps[1], taps[2], taps[3], fw, 3,
             (const float*)m.trunk_ptr("dspark.markov_head.dflare_norm.weight"),
-            d_f_rnn + (size_t)p0 * kInkHidden, M);
+            d_f_rnn, M, p0, f_rnn_cap);
     }
 
     void ingest_taps(int p0, int M) {
@@ -1386,7 +1405,7 @@ struct InkDSpark {
                 d_k, (const float*)m.trunk_ptr(p + ".self_attn.k_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkKVHeads);
             k_dspark_block_attn<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
                 d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il], d_apos,
-                m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win, B, d_attn_out);
+                m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win, ctx_cap[il], B, d_attn_out);
             dspark_linear_b8(p + ".self_attn.o_proj.weight", d_attn_out, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
 
@@ -1453,7 +1472,7 @@ struct InkDSpark {
         for (int s = 0; s < 7; ++s) {
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep<<<1, 256, 0, r.st>>>(
-                prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos,
+                prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos, f_rnn_cap,
                 m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint, d_rnn_proj, 1);
             k_dspark_markov_gru_upd<<<1, 256, 0, r.st>>>(
@@ -1497,7 +1516,7 @@ struct InkDSpark {
             const int nw = (s == 0) ? 1 : beam_w;
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep_batch<<<nw, 256, 0, r.st>>>(
-                d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos,
+                d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos, f_rnn_cap,
                 m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint_b, nw);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint_b, d_rnn_proj_b, nw);
             k_dspark_markov_gru_upd_batch<<<nw, 256, 0, r.st>>>(

@@ -339,7 +339,7 @@ struct InkCudaModel {
         const auto& ui = man.get("model.llm.unembed.weight");
         if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot));
-            if (vfree > (2048ull << 20)) {
+            if (vfree > std::max<size_t>(2048ull << 20, reserve + (512ull << 20))) {
                 unembed_screen.V = man.c.vocab_unpadded;
                 unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
                 unembed_screen.sc  = dalloc<float>(unembed_screen.V);
@@ -527,16 +527,18 @@ struct InkCudaRunner {
                 max_batch = 512;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
-            const size_t bpe = (kv_dtype == InkKvDtype::FP8) ? 2 : 4;  // K+V bytes per element
-            const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
-            const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
+            // Exact per-position KV bytes per visit: FP16=4096 B, FP8=2112 B, K4V4=1152 B (64+8 B/head x 8 heads x K+V)
+            const size_t bytes_per_pos = (kv_dtype == InkKvDtype::K4V4) ? (size_t)(2 * kInkKVHeads * (kInkHeadDim / 2 + 4 * 2))
+                                       : (kv_dtype == InkKvDtype::FP8)  ? (size_t)(kInkKVDim * 2 + 2 * kInkKVHeads * 4)
+                                                                         : (size_t)(kInkKVDim * 4);
+            const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * bytes_per_pos;
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
             const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20)
                                       : (max_slots == 1 && max_batch <= 256) ? (160ull << 20)
                                                                              : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
-                const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
+                const size_t per_pos_glob = (size_t)8 * max_slots * bytes_per_pos;
                 const int fit_ctx = (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63);
                 if (fit_ctx < max_ctx) {
                     const int clamped = std::max(256, fit_ctx);
@@ -559,8 +561,14 @@ struct InkCudaRunner {
             kv_desc[v].cap_pos = cap;
             kv_desc[v].is_swa = swa;
             kv_desc[v].is_fp8 = (kv_dtype == InkKvDtype::FP8);
+            kv_desc[v].is_k4v4 = (kv_dtype == InkKvDtype::K4V4);
             const size_t elems = (size_t)max_slots * cap * kInkKVHeads * kInkHeadDim;
-            if (!kv_desc[v].is_fp8) {
+            if (kv_desc[v].is_k4v4) {
+                kv_desc[v].k_f8    = dalloc<uint8_t>(elems / 2);
+                kv_desc[v].v_f8    = dalloc<uint8_t>(elems / 2);
+                kv_desc[v].k_sc_q4 = dalloc<__half>((size_t)max_slots * cap * kInkKVHeads * 4);
+                kv_desc[v].v_sc_q4 = dalloc<__half>((size_t)max_slots * cap * kInkKVHeads * 4);
+            } else if (!kv_desc[v].is_fp8) {
                 kv_desc[v].k_f16 = dalloc<__half>(elems);
                 kv_desc[v].v_f16 = dalloc<__half>(elems);
             } else {
@@ -1642,6 +1650,8 @@ struct InkCudaRunner {
             if (kv_desc[v].v_f8)  cudaFree(kv_desc[v].v_f8);
             if (kv_desc[v].k_sc)  cudaFree(kv_desc[v].k_sc);
             if (kv_desc[v].v_sc)  cudaFree(kv_desc[v].v_sc);
+            if (kv_desc[v].k_sc_q4) cudaFree(kv_desc[v].k_sc_q4);
+            if (kv_desc[v].v_sc_q4) cudaFree(kv_desc[v].v_sc_q4);
             if (d_sconv_pool[v])  cudaFree(d_sconv_pool[v]);
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };

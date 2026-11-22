@@ -88,7 +88,11 @@ __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
         const float vv_val = stage_v[sbase];
         const size_t dbase = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
 
-        if (!kv.is_fp8) {
+        if (kv.is_k4v4) {
+            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h;
+            ink_q4_write_head(kv_val, d, kv.k_f8 + sidx * 64, kv.k_sc_q4 + sidx * 4);
+            ink_q4_write_head(vv_val, d, kv.v_f8 + sidx * 64, kv.v_sc_q4 + sidx * 4);
+        } else if (!kv.is_fp8) {
             kv.k_f16[dbase + d] = __float2half(kv_val);
             kv.v_f16[dbase + d] = __float2half(vv_val);
         } else {

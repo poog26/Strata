@@ -379,7 +379,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
 
     proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
-          P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
+          P, kv_dtype_name(cfg.bopts.kv_dtype),
           use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
@@ -507,7 +507,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             auto st = backend.stats();
             proto("STATS active_slots=%d max_slots=%d vram_experts=%zu ram_experts=%zu total_experts=%zu kv=%s",
                   st.active_slots, st.max_slots, st.vram_experts_loaded, st.ram_experts_loaded, st.total_experts,
-                  st.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16");
+                  kv_dtype_name(st.kv_dtype));
             return true;
         }
         if (line == "STOP") {

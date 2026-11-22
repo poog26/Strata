@@ -125,12 +125,13 @@ public:
         const int eff_chunk = tight_8gb ? std::max(64, std::min(opts.chunk, 256)) : std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
-        const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
-        const size_t sc_per_pos = (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(2 * strata::ink::kInkKVHeads * 4) : 0ull;
+        const size_t bytes_per_pos = (kv_dtype_ == KvDtype::K4V4)     ? (size_t)(2 * strata::ink::kInkKVHeads * (strata::ink::kInkHeadDim / 2 + 4 * 2))
+                                   : (kv_dtype_ == KvDtype::FP8_E4M3) ? (size_t)(strata::ink::kInkKVDim * 2 + 2 * strata::ink::kInkKVHeads * 4)
+                                                                      : (size_t)(strata::ink::kInkKVDim * 4);
         const size_t target_ctx = (size_t)std::max(256, opts.max_ctx);
-        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos)
+        const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * bytes_per_pos
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
-                                  + (size_t)8 * max_slots_ * target_ctx * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
+                                  + (size_t)8 * max_slots_ * target_ctx * bytes_per_pos;
         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
                              : tight_8gb                              ? (210ull << 20)
@@ -146,8 +147,9 @@ public:
         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
         if (!model_.load(mf.path, gpu_id_, build_screen, err, min_reserve_bytes)) return false;
 
-        auto cuda_kvd = (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
-                                                          : strata::ink::InkKvDtype::FP16;
+        auto cuda_kvd = (kv_dtype_ == KvDtype::K4V4)     ? strata::ink::InkKvDtype::K4V4
+                      : (kv_dtype_ == KvDtype::FP8_E4M3) ? strata::ink::InkKvDtype::FP8
+                                                         : strata::ink::InkKvDtype::FP16;
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         runner_->use_cuda_graph = true;

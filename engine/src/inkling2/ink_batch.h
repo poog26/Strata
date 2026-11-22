@@ -18,6 +18,7 @@ enum class KvDtype : uint8_t {
     FP8_E4M3 = 1, // 16 KiB/tok Global (64 MiB per 4K slot!), 80 MiB max SWA-1024 -> 64 slots fit in 16-32 GB GPU!
     K8V8     = 2, // 16.5 KiB/tok Global: symmetric INT8 K & INT8 V with per-64 FP16 scales (#6520 / @merbanan)
     K8V4     = 3, // 12.75 KiB/tok Global: symmetric INT8 K + 4-bit asymmetric V with per-64 FP16 scale & min (#6520 / @merbanan)
+    K4V4     = 4, // 9.0 KiB/tok Global: symmetric 4-bit K & 4-bit V with per-32 FP16 scales (100k-256k ctx on 8 GiB GPU!)
 };
 
 inline const char* kv_dtype_name(KvDtype dt) noexcept {
@@ -26,6 +27,7 @@ inline const char* kv_dtype_name(KvDtype dt) noexcept {
         case KvDtype::FP8_E4M3: return "fp8";
         case KvDtype::K8V8:     return "k8v8";
         case KvDtype::K8V4:     return "k8v4";
+        case KvDtype::K4V4:     return "k4v4";
         default:                return "fp16";
     }
 }
