@@ -219,7 +219,7 @@ struct InkCudaModel {
             // `reserve` already includes exact SWA + target global KV + DSpark + workspaces!
             const size_t post_floor = (vtot <= (10ull << 30)) ? 0ull : (1664ull << 20);
             const size_t hyb_post_res = std::max(reserve, post_floor);
-            size_t promo_budget = 256ull << 20;
+            size_t promo_budget = (vtot <= (10ull << 30)) ? (192ull << 20) : (256ull << 20);
             if (const char* pe = std::getenv("STRATA_PROMO_MIB"); pe && *pe) {
                 int mb = std::atoi(pe);
                 promo_budget = (mb <= 0) ? 0 : ((size_t)mb << 20);
@@ -283,7 +283,8 @@ struct InkCudaModel {
                 size_t vf_now = 0, vt_now = 0;
                 INK_CK(ink_cuda_mem_info(&vf_now, &vt_now));
                 const size_t avail = (vf_now > hyb_post_res) ? (vf_now - hyb_post_res) : 0;
-                hybrid.alloc_staging(max_exp_bytes, avail);
+                // On <=10 GiB cards, defer promo ring until after runner+DSpark allocate so we scoop 100% of leftover VRAM!
+                hybrid.alloc_staging(max_exp_bytes, avail, /*defer_promo=*/(vtot <= (10ull << 30)));
             }
         }
         double t_exp = now_s() - t1;

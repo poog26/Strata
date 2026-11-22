@@ -22,6 +22,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #define INK_CK(call)                                                                                                  \
     do {                                                                                                              \
@@ -74,9 +83,60 @@ inline int current_sm_arch(int dev = 0) {
     return cached_sm;
 }
 
-// Unified-Memory-safe VRAM query: on Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA),
-// cudaMemGetInfo subtracts reclaimable OS page cache (like the 19 GB .strata file just read!),
-// so take max(cuda_free, /proc/meminfo MemAvailable) to prevent false hybrid spill!
+#if defined(_WIN32)
+struct InkNvmlMemory {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
+
+// On Windows WDDM, cudaMemGetInfo() artificially caps reported free VRAM at WDDM's conservative
+// per-process LocalBudget (~90% of physical VRAM, hiding ~550-750 MiB of real dedicated VRAM on 8 GB GPUs).
+// Query NVML (nvml.dll, shipped with the NVIDIA display driver) for true physical free VRAM!
+inline bool ink_nvml_mem_info(int cuda_dev, size_t* vfree_out, size_t* vtot_out) {
+    using nvmlInit_t     = int (*)();
+    using nvmlGetByPci_t = int (*)(const char*, void**);
+    using nvmlGetByIdx_t = int (*)(unsigned int, void**);
+    using nvmlGetMem_t   = int (*)(void*, InkNvmlMemory*);
+    static bool tried = false;
+    static nvmlGetByPci_t fn_pci = nullptr;
+    static nvmlGetByIdx_t fn_idx = nullptr;
+    static nvmlGetMem_t   fn_mem = nullptr;
+    if (!tried) {
+        tried = true;
+        HMODULE mod = LoadLibraryA("nvml.dll");
+        if (mod) {
+            auto fn_init = reinterpret_cast<nvmlInit_t>(GetProcAddress(mod, "nvmlInit_v2"));
+            if (fn_init && fn_init() == 0) {
+                fn_pci = reinterpret_cast<nvmlGetByPci_t>(GetProcAddress(mod, "nvmlDeviceGetHandleByPciBusId_v2"));
+                fn_idx = reinterpret_cast<nvmlGetByIdx_t>(GetProcAddress(mod, "nvmlDeviceGetHandleByIndex_v2"));
+                fn_mem = reinterpret_cast<nvmlGetMem_t>(GetProcAddress(mod, "nvmlDeviceGetMemoryInfo"));
+            }
+        }
+    }
+    if (!fn_mem) return false;
+    void* handle = nullptr;
+    char pci[64] = {};
+    if (fn_pci && cudaDeviceGetPCIBusId(pci, (int)sizeof(pci), cuda_dev) == cudaSuccess) {
+        if (fn_pci(pci, &handle) != 0) handle = nullptr;
+    }
+    if (!handle && fn_idx) {
+        if (fn_idx((unsigned int)cuda_dev, &handle) != 0) handle = nullptr;
+    }
+    if (!handle) return false;
+    InkNvmlMemory mem{};
+    if (fn_mem(handle, &mem) != 0 || mem.total == 0) return false;
+    *vfree_out = (size_t)mem.free;
+    *vtot_out  = (size_t)mem.total;
+    return true;
+}
+#endif
+
+// Unified-Memory-safe & Windows-WDDM-accurate VRAM query:
+// - On Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA), cudaMemGetInfo subtracts reclaimable
+//   OS page cache, so take max(cuda_free, /proc/meminfo MemAvailable).
+// - On Windows WDDM, cudaMemGetInfo hides ~550-750 MiB below physical VRAM; query nvml.dll so hybrid packing
+//   and post-init promo ring can utilize the full dedicated VRAM cleanly!
 inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) {
     cudaError_t ce = cudaMemGetInfo(vfree, vtot);
     if (ce != cudaSuccess) return ce;
@@ -98,6 +158,13 @@ inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) 
             }
             std::fclose(f);
         }
+    }
+#elif defined(_WIN32)
+    int cur = dev;
+    if (cur < 0) cudaGetDevice(&cur);
+    size_t nv_free = 0, nv_tot = 0;
+    if (ink_nvml_mem_info(cur, &nv_free, &nv_tot)) {
+        if (nv_free > *vfree) *vfree = std::min(nv_free, *vtot);
     }
 #else
     (void)dev;

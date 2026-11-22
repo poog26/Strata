@@ -817,8 +817,9 @@ struct InkHybridEngine {
         active = true;
     }
 
-    // Allocate ping-pong prefill streaming buffers + dynamic decode/tree promotion ring!
-    void alloc_staging(size_t max_exp_bytes, size_t vram_avail) {
+    // Allocate ping-pong prefill streaming buffers during load; dynamic promo ring can be allocated
+    // either here or post-init (alloc_promo_from_free) to scoop up 100% of remaining free VRAM!
+    void alloc_staging(size_t max_exp_bytes, size_t vram_avail, bool defer_promo = false) {
         if (!active) return;
         const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
         promo_slot_bytes = align_b;
@@ -832,22 +833,27 @@ struct InkHybridEngine {
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
             vram_avail = (vram_avail > 2 * pf_stage_bytes) ? (vram_avail - 2 * pf_stage_bytes) : 0;
         }
-        // Remaining staging budget becomes the dynamic decayed-frequency promotion ring!
-        size_t max_ring = 256ull << 20;
+        if (defer_promo) return;
+        alloc_promo_pool(vram_avail, 16ull << 20);
+    }
+
+    // Scoop all remaining free VRAM (above `cushion_bytes`) into the dynamic promotion ring AFTER runner+DSpark init!
+    void alloc_promo_pool(size_t vram_avail, size_t cushion_bytes) {
+        if (!active || d_promo_pool != nullptr || promo_slot_bytes == 0) return;
+        size_t max_ring = 1024ull << 20;
         if (const char* pe = std::getenv("STRATA_PROMO_MIB"); pe && *pe) {
             int mb = std::atoi(pe);
             max_ring = (mb <= 0) ? 0 : ((size_t)mb << 20);
         }
-        if (max_ring > 0 && vram_avail > (16ull << 20) + 4 * align_b && align_b > 0) {
-            const size_t ring_bytes = std::min<size_t>(max_ring, vram_avail - (16ull << 20));
-            n_promo_slots = (int)(ring_bytes / align_b);
-            if (n_promo_slots >= 4) {
-                INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * align_b));
-                promo_owner.assign(n_promo_slots, -1);
-                key_to_slot.assign(n_layers * n_experts, -1);
-            } else {
-                n_promo_slots = 0;
-            }
+        if (max_ring == 0 || vram_avail <= cushion_bytes + 4 * promo_slot_bytes) return;
+        const size_t ring_bytes = std::min<size_t>(max_ring, vram_avail - cushion_bytes);
+        n_promo_slots = (int)(ring_bytes / promo_slot_bytes);
+        if (n_promo_slots >= 4) {
+            INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * promo_slot_bytes));
+            promo_owner.assign(n_promo_slots, -1);
+            key_to_slot.assign(n_layers * n_experts, -1);
+        } else {
+            n_promo_slots = 0;
         }
     }
 

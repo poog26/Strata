@@ -132,9 +132,10 @@ public:
         const size_t min_kv_bytes = (size_t)40 * max_slots_ * swa_r * bytes_per_pos
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * target_ctx * bytes_per_pos;
+        const size_t dspark_pad = (opts.enable_dspark && mf.m.dspark.present) ? (64ull << 20) : 0ull;
         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
-                             : tight_8gb                              ? (210ull << 20)
+                             : tight_8gb                              ? ((480ull << 20) + dspark_pad)
                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
                                                                       : (320ull << 20));
         size_t min_reserve_bytes = min_kv_bytes + ws_pad;
@@ -165,6 +166,25 @@ public:
         d_sconv_snap_ = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
         d_h_sel_      = strata::ink::dalloc<float>((size_t)runner_->max_batch * strata::ink::kInkHidden);
         d_sel_idx_    = strata::ink::dalloc<int32_t>(runner_->max_batch);
+
+        // Scoop 100% of remaining free VRAM (above minimal WDDM/user cushion) into the dynamic expert promotion ring!
+        if (model_.n_host_experts > 0 && model_.hybrid.active && model_.hybrid.d_promo_pool == nullptr) {
+            size_t vf_post = 0, vt_post = 0;
+            if (strata::ink::ink_cuda_mem_info(&vf_post, &vt_post) == cudaSuccess) {
+                // Keep ~104 MiB physical VRAM free (safely above Windows WDDM's ~75-85 MiB DWM floor) to prevent silent shared-RAM paging
+                const size_t default_cushion = 104ull << 20;
+                const size_t cushion = (opts.vram_reserve_mib >= 0)
+                    ? ((size_t)opts.vram_reserve_mib << 20)
+                    : default_cushion;
+                model_.hybrid.alloc_promo_pool(vf_post, cushion);
+                size_t vf_fin = 0, vt_fin = 0;
+                strata::ink::ink_cuda_mem_info(&vf_fin, &vt_fin);
+                std::fprintf(stderr, "[InkCUDA] Post-init promo ring: %d slots (%.1f MiB), final free VRAM=%.1f MiB\n",
+                             model_.hybrid.n_promo_slots,
+                             (double)((size_t)model_.hybrid.n_promo_slots * model_.hybrid.promo_slot_bytes) / (1024.0 * 1024.0),
+                             (double)vf_fin / (1024.0 * 1024.0));
+            }
+        }
         slot_alloc_.assign(max_slots_, false);
         snap_active_.assign(max_slots_, false);
         snap_p0_.assign(max_slots_, 0);
