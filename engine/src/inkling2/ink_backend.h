@@ -63,16 +63,19 @@ public:
     virtual void snapshot_slot(int slot) = 0;
     virtual void rollback_slot(int slot, int keep_len) = 0;
 
-    // Bit-exact prefix KV cache checkpoint (SWA + ShortConv, plus optional Global KV RAM park for interrupting requests)
+    // Bit-exact prefix KV cache checkpoint (SWA + ShortConv, plus in-VRAM tail or RAM-parked Global KV for multi-context swapping!)
     struct PrefixCheckpoint {
         std::vector<int32_t> tokens;
         int pos = 0;
         bool has_global = false;
+        int vram_off = -1;          // >= 0: Global KV [0..pos) is parked in VRAM tail at [vram_off .. vram_off+pos)
+        uint64_t lru_tick = 0;
         std::vector<uint8_t> swa_buf;
         std::vector<uint8_t> sconv_buf;
         std::vector<uint8_t> glob_buf;
+        size_t ram_bytes() const noexcept { return swa_buf.size() + sconv_buf.size() + glob_buf.size(); }
         void clear() {
-            tokens.clear(); pos = 0; has_global = false;
+            tokens.clear(); pos = 0; has_global = false; vram_off = -1; lru_tick = 0;
             swa_buf.clear(); sconv_buf.clear(); glob_buf.clear();
         }
     };
@@ -80,7 +83,16 @@ public:
         (void)slot; (void)pos; (void)out;
         return false;
     }
+    virtual bool copy_global_kv_vram(int slot, int src_pos, int dst_pos, int n_pos) {
+        (void)slot; (void)src_pos; (void)dst_pos; (void)n_pos;
+        return false;
+    }
     virtual bool park_prefix_global_kv(int slot, PrefixCheckpoint& ckpt) {
+        (void)slot; (void)ckpt;
+        return false;
+    }
+    virtual bool park_prefix_global_kv_at(int slot, int src_pos, PrefixCheckpoint& ckpt) {
+        if (src_pos == 0) return park_prefix_global_kv(slot, ckpt);
         (void)slot; (void)ckpt;
         return false;
     }

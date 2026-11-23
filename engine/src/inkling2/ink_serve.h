@@ -386,7 +386,99 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
     std::vector<ActiveReq> reqs(P);
-    InkBackend::PrefixCheckpoint parked_ckpt;  // parked long-conversation KV in host RAM (survives interrupting aux calls!)
+    // Multi-context KV pool: packs parked conversations in the empty tail [active_end .. max_ctx) of the
+    // already-allocated VRAM Global KV buffer (~1 ms D2D swap, zero extra VRAM) with automatic host RAM LRU overflow!
+    std::vector<InkBackend::PrefixCheckpoint> kv_pool;
+    uint64_t pool_clock = 0;
+    constexpr size_t kMaxPoolEntries = 8;
+    constexpr size_t kMaxPoolRamBytes = 1024ull << 20;
+
+    auto enforce_pool_limits = [&]() {
+        auto total_ram = [&]() {
+            size_t s = 0;
+            for (const auto& e : kv_pool) s += e.ram_bytes();
+            return s;
+        };
+        while (kv_pool.size() > kMaxPoolEntries || (kv_pool.size() > 1 && total_ram() > kMaxPoolRamBytes)) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < kv_pool.size(); ++i) {
+                if (kv_pool[i].lru_tick < kv_pool[oldest].lru_tick) oldest = i;
+            }
+            kv_pool.erase(kv_pool.begin() + oldest);
+        }
+    };
+
+    auto alloc_vram_tail = [&](int need_len, int min_pos) -> int {
+        if (P != 1 || need_len <= 0 || min_pos + need_len > cfg.bopts.max_ctx) return -1;
+        std::vector<std::pair<int, int>> used;
+        for (const auto& e : kv_pool) {
+            if (e.vram_off >= 0 && e.pos > 0) used.emplace_back(e.vram_off, e.vram_off + e.pos);
+        }
+        std::sort(used.begin(), used.end());
+        int hi = cfg.bopts.max_ctx;
+        for (int i = static_cast<int>(used.size()) - 1; i >= 0; --i) {
+            const int lo = std::max(min_pos, used[i].second);
+            if (hi - lo >= need_len) return hi - need_len;
+            hi = std::min(hi, used[i].first);
+        }
+        if (hi - min_pos >= need_len) return hi - need_len;
+        return -1;
+    };
+
+    auto evict_vram_tail_below = [&](int min_free_pos) {
+        if (P != 1 || kv_pool.empty()) return;
+        bool changed = false;
+        for (size_t i = 0; i < kv_pool.size(); ) {
+            auto& e = kv_pool[i];
+            if (e.vram_off >= 0 && e.vram_off < min_free_pos) {
+                if (backend.park_prefix_global_kv_at(0, e.vram_off, e)) {
+                    std::fprintf(stderr, "[InkCUDA] KV pool: spilled %d tok VRAM tail -> host RAM (%.1f MiB)\n",
+                                 e.pos, (double)e.glob_buf.size() / (1024.0 * 1024.0));
+                    changed = true;
+                    ++i;
+                } else {
+                    kv_pool.erase(kv_pool.begin() + i);
+                    changed = true;
+                }
+            } else {
+                ++i;
+            }
+        }
+        if (changed) enforce_pool_limits();
+    };
+
+    auto park_active_to_pool = [&](ActiveReq& rq, int next_need_pos, uint64_t protect_tick = 0) {
+        if (P != 1 || rq.slot != 0 || rq.prefill_ckpt.pos < 128 || rq.prefill_ckpt.has_global || rq.prefill_ckpt.vram_off >= 0) return;
+        // Supersede any older checkpoint of the SAME conversation already in kv_pool
+        for (size_t i = 0; i < kv_pool.size(); ) {
+            const auto& e = kv_pool[i];
+            if (e.lru_tick != protect_tick && !e.tokens.empty() && e.tokens.size() <= rq.prefill_ckpt.tokens.size()
+                && std::equal(e.tokens.begin(), e.tokens.end(), rq.prefill_ckpt.tokens.begin())) {
+                kv_pool.erase(kv_pool.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+        const int min_pos = std::max(rq.prefill_ckpt.pos, next_need_pos);
+        const int off = alloc_vram_tail(rq.prefill_ckpt.pos, min_pos);
+        if (off >= 0 && backend.copy_global_kv_vram(rq.slot, 0, off, rq.prefill_ckpt.pos)) {
+            rq.prefill_ckpt.vram_off = off;
+            rq.prefill_ckpt.has_global = false;
+            rq.prefill_ckpt.glob_buf.clear();
+            rq.prefill_ckpt.lru_tick = ++pool_clock;
+            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in VRAM tail [%d..%d) (pool=%zu)\n",
+                         rq.prefill_ckpt.pos, off, off + rq.prefill_ckpt.pos, kv_pool.size() + 1);
+            kv_pool.push_back(std::move(rq.prefill_ckpt));
+            enforce_pool_limits();
+        } else if (backend.park_prefix_global_kv(rq.slot, rq.prefill_ckpt)) {
+            rq.prefill_ckpt.lru_tick = ++pool_clock;
+            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in host RAM (%.1f MiB, pool=%zu)\n",
+                         rq.prefill_ckpt.pos, (double)rq.prefill_ckpt.glob_buf.size() / (1024.0 * 1024.0), kv_pool.size() + 1);
+            kv_pool.push_back(std::move(rq.prefill_ckpt));
+            enforce_pool_limits();
+        }
+    };
+
     std::unordered_map<std::string, int> req_id_to_slot;
     ServeInput in;
     in.start();
@@ -487,41 +579,68 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             }
         }
 
-        // Prefix reuse check (exact continuation, in-VRAM prefill checkpoint, or RAM-parked checkpoint!)
+        // Prefix reuse check (exact continuation, in-VRAM prefill checkpoint, or multi-context VRAM-tail/RAM pool!)
         auto exact_prefix_match = [&](const std::vector<int32_t>& pfx) -> bool {
             return !pfx.empty()
                 && static_cast<int>(pfx.size()) < rq.prompt_len
                 && std::equal(pfx.begin(), pfx.end(), rq.prompt_ids.begin());
         };
+        const int active_need = std::min(cfg.bopts.max_ctx, rq.prompt_len + std::min(rq.max_new, 2048));
         int reuse = 0;
         if (pg.images.empty()) {
             if (exact_prefix_match(rq.cached_prefix)) {
                 reuse = static_cast<int>(rq.cached_prefix.size());
-            } else if (!rq.prefill_ckpt.has_global && exact_prefix_match(rq.prefill_ckpt.tokens)) {
+                evict_vram_tail_below(active_need);
+            } else if (!rq.prefill_ckpt.has_global && rq.prefill_ckpt.vram_off < 0 && exact_prefix_match(rq.prefill_ckpt.tokens)) {
                 if (backend.restore_prefix_checkpoint(rq.slot, rq.prefill_ckpt)) {
                     reuse = rq.prefill_ckpt.pos;
                     rq.cached_prefix = rq.prefill_ckpt.tokens;
+                    evict_vram_tail_below(active_need);
                 }
-            } else if (parked_ckpt.has_global && exact_prefix_match(parked_ckpt.tokens)) {
-                if (backend.restore_prefix_checkpoint(rq.slot, parked_ckpt)) {
-                    reuse = parked_ckpt.pos;
-                    rq.cached_prefix = parked_ckpt.tokens;
-                    rq.prefill_ckpt.tokens = parked_ckpt.tokens;
-                    rq.prefill_ckpt.pos = parked_ckpt.pos;
-                    rq.prefill_ckpt.swa_buf = parked_ckpt.swa_buf;
-                    rq.prefill_ckpt.sconv_buf = parked_ckpt.sconv_buf;
-                    rq.prefill_ckpt.glob_buf.clear();
-                    rq.prefill_ckpt.has_global = false;
+            } else if (P == 1 && !kv_pool.empty()) {
+                // Find longest matching conversation in multi-context KV pool
+                int best_idx = -1;
+                for (size_t i = 0; i < kv_pool.size(); ++i) {
+                    if (exact_prefix_match(kv_pool[i].tokens)) {
+                        if (best_idx < 0 || kv_pool[i].pos > kv_pool[best_idx].pos) best_idx = static_cast<int>(i);
+                    }
+                }
+                if (best_idx >= 0) {
+                    const uint64_t target_tick = kv_pool[best_idx].lru_tick;
+                    // Park the currently active conversation first while protecting `target_tick`
+                    park_active_to_pool(rq, active_need, target_tick);
+                    // Locate target again (indices may have shifted if an older entry was superseded)
+                    int ti = -1;
+                    for (size_t i = 0; i < kv_pool.size(); ++i) {
+                        if (kv_pool[i].lru_tick == target_tick) { ti = static_cast<int>(i); break; }
+                    }
+                    if (ti >= 0) {
+                        auto target = std::move(kv_pool[ti]);
+                        kv_pool.erase(kv_pool.begin() + ti);
+                        // If target's VRAM range overlaps [0..target.pos), bounce through RAM safely
+                        if (target.vram_off >= 0 && target.vram_off < target.pos) {
+                            backend.park_prefix_global_kv_at(0, target.vram_off, target);
+                        }
+                        const bool from_vram = (target.vram_off >= 0);
+                        if (backend.restore_prefix_checkpoint(rq.slot, target)) {
+                            std::fprintf(stderr, "[InkCUDA] KV pool: restored %d tok from %s (pool=%zu)\n",
+                                         target.pos, from_vram ? "VRAM tail" : "host RAM", kv_pool.size());
+                            reuse = target.pos;
+                            rq.cached_prefix = target.tokens;
+                            rq.prefill_ckpt = std::move(target);
+                            rq.prefill_ckpt.vram_off = -1;
+                            rq.prefill_ckpt.has_global = false;
+                            rq.prefill_ckpt.glob_buf.clear();
+                            evict_vram_tail_below(active_need);
+                        }
+                    }
                 }
             }
         }
         if (reuse == 0) {
-            // Park current slot's long conversation KV in host RAM before resetting for an interrupting request!
-            if (rq.prefill_ckpt.pos >= 512 && !rq.prefill_ckpt.has_global && rq.prefill_ckpt.pos >= parked_ckpt.pos) {
-                if (backend.park_prefix_global_kv(rq.slot, rq.prefill_ckpt)) {
-                    parked_ckpt = std::move(rq.prefill_ckpt);
-                }
-            }
+            // Park current slot's conversation into VRAM tail (or host RAM overflow) before resetting!
+            park_active_to_pool(rq, active_need);
+            evict_vram_tail_below(active_need);
             backend.reset_slot(rq.slot);
             rq.cached_prefix.clear();
             rq.prefill_ckpt.clear();
@@ -798,6 +917,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         for (int s = 0; s < P; ++s) {
             auto& rq = reqs[s];
             if (!rq.active || rq.prefill_pos < rq.prompt_len) continue;
+            if (P == 1 && !kv_pool.empty()) evict_vram_tail_below(rq.cur_pos + 32);
             batch.push(s, rq.cur_pos, rq.next_tok, true);
             logit_slots.push_back(s);
             --token_budget;

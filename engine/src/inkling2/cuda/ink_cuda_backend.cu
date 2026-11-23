@@ -307,8 +307,50 @@ public:
         return true;
     }
 
+    bool copy_global_kv_vram(int slot, int src_pos, int dst_pos, int n_pos) override {
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || n_pos <= 0) return false;
+        if (src_pos < 0 || dst_pos < 0 || src_pos + n_pos > runner_->max_ctx || dst_pos + n_pos > runner_->max_ctx) return false;
+        if (src_pos == dst_pos) return true;
+        // Reject overlapping D2D ranges to guarantee zero corruption
+        if (!(dst_pos + n_pos <= src_pos || src_pos + n_pos <= dst_pos)) return false;
+        const size_t npos = (size_t)n_pos;
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const auto& kv = runner_->kv_desc[v];
+            if (kv.is_swa) continue;
+            const size_t sbase = (size_t)slot * (size_t)kv.cap_pos + (size_t)src_pos;
+            const size_t dbase = (size_t)slot * (size_t)kv.cap_pos + (size_t)dst_pos;
+            if (kv.is_k4v4) {
+                const size_t nb = npos * (strata::ink::kInkKVHeads * strata::ink::kInkHeadDim / 2);
+                const size_t ns = npos * (strata::ink::kInkKVHeads * 4) * sizeof(__half);
+                const size_t bstride = strata::ink::kInkKVHeads * strata::ink::kInkHeadDim / 2;
+                const size_t sstride = strata::ink::kInkKVHeads * 4;
+                INK_CK(cudaMemcpyAsync(kv.k_f8 + dbase * bstride, kv.k_f8 + sbase * bstride, nb, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.v_f8 + dbase * bstride, kv.v_f8 + sbase * bstride, nb, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.k_sc_q4 + dbase * sstride, kv.k_sc_q4 + sbase * sstride, ns, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.v_sc_q4 + dbase * sstride, kv.v_sc_q4 + sbase * sstride, ns, cudaMemcpyDeviceToDevice, runner_->st));
+            } else if (kv.is_fp8) {
+                const size_t nb = npos * strata::ink::kInkKVDim;
+                const size_t ns = npos * strata::ink::kInkKVHeads * sizeof(float);
+                INK_CK(cudaMemcpyAsync(kv.k_f8 + dbase * strata::ink::kInkKVDim, kv.k_f8 + sbase * strata::ink::kInkKVDim, nb, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.v_f8 + dbase * strata::ink::kInkKVDim, kv.v_f8 + sbase * strata::ink::kInkKVDim, nb, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.k_sc + dbase * strata::ink::kInkKVHeads, kv.k_sc + sbase * strata::ink::kInkKVHeads, ns, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.v_sc + dbase * strata::ink::kInkKVHeads, kv.v_sc + sbase * strata::ink::kInkKVHeads, ns, cudaMemcpyDeviceToDevice, runner_->st));
+            } else {
+                const size_t nb = npos * strata::ink::kInkKVDim * sizeof(__half);
+                INK_CK(cudaMemcpyAsync(kv.k_f16 + dbase * strata::ink::kInkKVDim, kv.k_f16 + sbase * strata::ink::kInkKVDim, nb, cudaMemcpyDeviceToDevice, runner_->st));
+                INK_CK(cudaMemcpyAsync(kv.v_f16 + dbase * strata::ink::kInkKVDim, kv.v_f16 + sbase * strata::ink::kInkKVDim, nb, cudaMemcpyDeviceToDevice, runner_->st));
+            }
+        }
+        INK_CK(cudaStreamSynchronize(runner_->st));
+        return true;
+    }
+
     bool park_prefix_global_kv(int slot, PrefixCheckpoint& ckpt) override {
-        if (!initialized_ || slot < 0 || slot >= max_slots_ || ckpt.pos <= 0 || ckpt.pos > runner_->max_ctx) return false;
+        return park_prefix_global_kv_at(slot, 0, ckpt);
+    }
+
+    bool park_prefix_global_kv_at(int slot, int src_pos, PrefixCheckpoint& ckpt) override {
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || src_pos < 0 || ckpt.pos <= 0 || src_pos + ckpt.pos > runner_->max_ctx) return false;
         const size_t npos = (size_t)ckpt.pos;
         size_t glob_total = 0;
         for (int v = 0; v < strata::ink::kInkVisits; ++v) {
@@ -318,7 +360,7 @@ public:
             else if (kv.is_fp8)  glob_total += npos * (2 * strata::ink::kInkKVDim + 2 * strata::ink::kInkKVHeads * sizeof(float));
             else                 glob_total += npos * (2 * strata::ink::kInkKVDim * sizeof(__half));
         }
-        // Cap parked global KV in host RAM at 1024 MiB (~115k tokens in k4v4) so 16 GB RAM stays safe
+        // Cap single parked global KV in host RAM at 1024 MiB (~115k tokens in k4v4) so 16 GB RAM stays safe
         if (glob_total > (1024ull << 20)) return false;
         INK_CK(cudaStreamSynchronize(runner_->st));
         ckpt.glob_buf.resize(glob_total);
@@ -326,7 +368,7 @@ public:
         for (int v = 0; v < strata::ink::kInkVisits; ++v) {
             const auto& kv = runner_->kv_desc[v];
             if (kv.is_swa) continue;
-            const size_t base = (size_t)slot * (size_t)kv.cap_pos;
+            const size_t base = (size_t)slot * (size_t)kv.cap_pos + (size_t)src_pos;
             if (kv.is_k4v4) {
                 const size_t nb = npos * (strata::ink::kInkKVHeads * strata::ink::kInkHeadDim / 2);
                 const size_t ns = npos * (strata::ink::kInkKVHeads * 4) * sizeof(__half);
@@ -348,12 +390,16 @@ public:
             }
         }
         ckpt.has_global = true;
+        ckpt.vram_off = -1;
         return true;
     }
 
     bool restore_prefix_checkpoint(int slot, const PrefixCheckpoint& ckpt) override {
         if (!initialized_ || slot < 0 || slot >= max_slots_ || ckpt.pos <= 0 || ckpt.pos > runner_->max_ctx) return false;
         if (ckpt.sconv_buf.empty() || ckpt.swa_buf.empty()) return false;
+        if (ckpt.vram_off >= 0) {
+            if (!copy_global_kv_vram(slot, ckpt.vram_off, 0, ckpt.pos)) return false;
+        }
         INK_CK(cudaStreamSynchronize(runner_->st));
         const size_t sconv_each = (size_t)3 * strata::ink::kInkSconvCh * sizeof(float);
         const size_t npos = (size_t)ckpt.pos;
