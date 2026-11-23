@@ -233,8 +233,8 @@ class InklingDialect:
         if not chunk:
             return
         if self.state == "think":
-            # Inkling-2-Mini has no thinking mode (off / "none" only): keep hidden unless truncated with no answer (#6682).
             self._append_think(chunk)
+            out.append(("reasoning", chunk))
             return
         elif self.state == "think_end":
             # Lookahead after <|end_message|> in thinking (#6675): only another structural tag confirms end-of-thinking;
@@ -242,7 +242,9 @@ class InklingDialect:
             if not chunk.strip():
                 self._end_ws += chunk
                 return
-            self._append_think(END_MSG + self._end_ws + chunk)
+            restored = END_MSG + self._end_ws + chunk
+            self._append_think(restored)
+            out.append(("reasoning", restored))
             self._end_ws = ""
             self.state = "think"
             return
@@ -396,24 +398,42 @@ def translate(text: str) -> str:
     return InklingDialect().feed(text, final=True)
 
 
-# ---- thinking mode: Inkling-2-Mini has NO thinking mode (default is off / "none", and that's it) ----
-DEFAULT_EFFORT = "none"
+# ---- thinking mode: Inkling-2-Mini supports none|minimal|low|medium|high|xhigh|max ----
+DEFAULT_EFFORT = "medium"
 EFFORT = {
     "none": "none", "off": "none", "no_think": "none", "disabled": "none", "false": "none", "0": "none", "0.0": "none",
+    "minimal": "minimal", "min": "minimal",
+    "low": "low",
+    "medium": "medium", "med": "medium", "auto": "medium",
+    "high": "high",
+    "xhigh": "xhigh", "max": "max",
 }
 
 
 def normalize_effort(value=None) -> str:
-    """Inkling-2-Mini has no thinking mode: always normalizes to `"none"` (`Thinking effort level: 0`)."""
-    return DEFAULT_EFFORT
+    """Normalize reasoning_effort for Inkling-2-Mini's chat_template.jinja (none|minimal|low|medium|high|xhigh|max)."""
+    if value is None or value == "":
+        return DEFAULT_EFFORT
+    if isinstance(value, bool):
+        return DEFAULT_EFFORT if value else "none"
+    key = str(value).strip().lower()
+    return EFFORT.get(key, DEFAULT_EFFORT)
 
 
 def template_kwargs(kwargs: dict) -> dict:
-    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja: always enforces thinking off (`reasoning_effort="none"`)."""
+    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja, honoring client reasoning_effort / enable_thinking."""
     out = dict(kwargs)
     out.pop("thinking_mode", None)
-    out["enable_thinking"] = False
-    out["reasoning_effort"] = DEFAULT_EFFORT
+    eff = out.get("reasoning_effort")
+    en = out.get("enable_thinking")
+    if eff not in (None, ""):
+        norm = normalize_effort(eff)
+    elif en is False:
+        norm = "none"
+    else:
+        norm = DEFAULT_EFFORT
+    out["reasoning_effort"] = norm
+    out["enable_thinking"] = (norm != "none")
     return out
 
 

@@ -134,100 +134,12 @@ inline bool finite_logits(const float* lg, int V) noexcept {
     return true;
 }
 
-// Exact lossless speculative verification sampler for DSpark (Leviathan et al., 2023):
-// Given target logits `lg[0..V-1]` and a deterministic draft token `draft_tok`:
-//   - If greedy: picks argmax and accepts iff argmax == draft_tok.
-//   - If non-greedy (temperature > 0 / top_k / min_p / top_p / penalties):
-//     Computes exact target distribution p(x), accepts `draft_tok` with probability p(draft_tok),
-//     else samples from exact residual p(x) / (1 - p(draft_tok)) over x != draft_tok.
-// Marginal distribution of emitted tokens is 100% mathematically identical to sample_logits()!
-inline int32_t verify_draft_logits(
-    float* lg, int V, const SampleOpts& s, const std::vector<int32_t>& hist,
-    std::mt19937_64& rng, int32_t draft_tok, bool& accepted) {
-    accepted = false;
-    if (s.greedy()) {
-        const int32_t tok = sample_logits(lg, V, s, hist, rng);
-        accepted = (tok == draft_tok);
-        return tok;
-    }
-    if (s.penalties() && s.last_n > 0) {
-        size_t start = static_cast<size_t>(std::max(0, s.pen_from));
-        if (hist.size() > start) {
-            size_t from = (hist.size() - start > static_cast<size_t>(s.last_n)) ? (hist.size() - static_cast<size_t>(s.last_n)) : start;
-            std::unordered_map<int32_t, int> cnt;
-            for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-            for (const auto& kv : cnt) {
-                if (kv.first < 0 || kv.first >= V) continue;
-                float& x = lg[kv.first];
-                if (s.rep != 1.0f) x = (x > 0.0f) ? (x / s.rep) : (x * s.rep);
-                x -= static_cast<float>(kv.second) * s.freq + (s.pres != 0.0f ? s.pres : 0.0f);
-            }
-        }
-    }
-    const int K = std::min(std::max(1, s.top_k), std::min(V, 128));
-    std::vector<int> idx(V);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
-                      [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
-    std::vector<double> p(K);
-    double mx = lg[idx[0]], sum = 0.0;
-    for (int i = 0; i < K; ++i) {
-        p[i] = std::exp((lg[idx[i]] - mx) / static_cast<double>(s.temperature));
-        sum += p[i];
-    }
-    for (double& x : p) x /= sum;
-    int keep = K;
-    if (s.min_p > 0.0f) {
-        const double thr = static_cast<double>(s.min_p) * p[0];
-        keep = 1;
-        while (keep < K && p[keep] >= thr) ++keep;
-    }
-    if (s.top_p < 1.0f) {
-        double c = 0.0;
-        int k2 = 0;
-        while (k2 < keep) {
-            c += p[k2++];
-            if (c >= static_cast<double>(s.top_p)) break;
-        }
-        keep = std::max(1, k2);
-    }
-    double z = 0.0;
-    int draft_pos = -1;
-    for (int i = 0; i < keep; ++i) {
-        z += p[i];
-        if (idx[i] == draft_tok) draft_pos = i;
-    }
-    if (z <= 0.0) return idx[0];
-    const double p_draft = (draft_pos >= 0) ? (p[draft_pos] / z) : 0.0;
-    std::uniform_real_distribution<double> u01(0.0, 1.0);
-    if (draft_pos >= 0 && (keep == 1 || u01(rng) < p_draft)) {
-        accepted = true;
-        return draft_tok;
-    }
-    // Rejected: sample from residual p(x) over i != draft_pos
-    const double z_rem = z - (draft_pos >= 0 ? p[draft_pos] : 0.0);
-    if (z_rem <= 0.0) {
-        accepted = (draft_pos >= 0);
-        return (draft_pos >= 0) ? draft_tok : idx[0];
-    }
-    const double r = u01(rng) * z_rem;
-    double c = 0.0;
-    int last_valid = idx[0];
-    for (int i = 0; i < keep; ++i) {
-        if (i == draft_pos) continue;
-        last_valid = idx[i];
-        c += p[i];
-        if (r <= c) return idx[i];
-    }
-    return last_valid;
-}
-
-// Anti-loop repetition detector: detects pathological n-gram stalling while avoiding false positives on structured YAML/JSON (#6620)
+// Anti-loop repetition detector: detects pathological n-gram stalling (exact period 1..32 repeated >= 8x)
 inline bool detect_repetition_loop(const std::vector<int32_t>& gen_ids) noexcept {
     const size_t n = gen_ids.size();
-    if (n < 96) return false;
+    if (n < 64) return false;
     for (size_t period = 1; period <= 32; ++period) {
-        const size_t need_reps = (period <= 4) ? 24 : 10;
+        const size_t need_reps = (period <= 4) ? 16 : 6;
         if (n < period * need_reps) continue;
         bool match = true;
         for (size_t k = 0; k < period * (need_reps - 1); ++k) {
@@ -414,10 +326,9 @@ struct ActiveReq {
     std::vector<float> img_embeds;
     std::vector<int32_t> hist;
     std::vector<int32_t> gen_ids;
-    std::vector<int32_t> cached_prefix;       // tokens currently resident in slot KV
-    std::vector<int32_t> prompt_ckpt_prefix;  // prompt-end checkpoint prefix saved before generation (#6627)
-    int reused_tokens = 0;                    // prefix tokens reused for this request
-    bool ckpt_pending = false;                // true while prefilling up to prompt_len - 1 to save checkpoint
+    std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
+    int snap_target = 0;                 // boundary token position for bit-exact SWA+ShortConv prefix checkpoint
+    InkBackend::PrefixCheckpoint prefill_ckpt;
     double t_start = 0.0;
     double prompt_ms = 0.0;
     double decode_t0 = 0.0;
@@ -435,7 +346,7 @@ struct ServeConfig {
     std::string draft_mode = "auto";  // auto | dspark | off
     bool force_cpu = false;
     bool anti_loop = true;
-    std::string version = "0.1.66";
+    std::string version = "0.1.65";
 };
 
 inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& backend) {
@@ -443,7 +354,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     const int V = c.vocab_unpadded;
     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
     const int chunk_sz = std::max(1, cfg.bopts.chunk);
-    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
+    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present;
 
     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
     bool images_ok = false;
@@ -468,23 +379,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
 
-    const int eff_max_ctx = (backend.effective_max_ctx() > 0) ? backend.effective_max_ctx() : cfg.bopts.max_ctx;
-    const auto kv_str = [&]() -> const char* {
-        const KvDtype kd = backend.stats().kv_dtype;
-        if (kd == KvDtype::FP8_E4M3) return "fp8";
-        if (kd == KvDtype::K8V8)     return "k8v8";
-        if (kd == KvDtype::K8V4)     return "k8v4";
-        return "fp16";
-    }();
-    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s drafting=%s images=%d image_pad=%d parallel=%d",
+    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
-          P, kv_str,
-          mf.m.dspark.present ? "dspark" : "none",
-          use_dspark ? "dspark" : "off",
-          images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
-    proto("READY %d stop hold holdb", eff_max_ctx);
+          P, kv_dtype_name(cfg.bopts.kv_dtype),
+          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
+    proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
     std::vector<ActiveReq> reqs(P);
+    InkBackend::PrefixCheckpoint parked_ckpt;  // parked long-conversation KV in host RAM (survives interrupting aux calls!)
     std::unordered_map<std::string, int> req_id_to_slot;
     ServeInput in;
     in.start();
@@ -496,20 +398,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     auto finish_req = [&](ActiveReq& rq, const char* reason) {
         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
         if (rq.is_solo) {
-            // Emit full 9-field DONE line so server.py _parse_done() records drafts_accepted, drafts_offered, reused (#6633, #6627)!
-            proto("DONE %d %d %.1f %.1f %s %d %d %d",
-                  rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
-                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
+            proto("DONE %d %d %.1f %.1f %s", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
         } else if (rq.is_ext_gen) {
-            proto("DONE %s %d %d %.1f %.1f %s %d %d %d",
-                  rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
-                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
+            proto("DONE %s %d %d %.1f %.1f %s", rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
             req_id_to_slot.erase(rq.req_id);
         } else {
             if (!rq.admitted) {
-                proto("DONE %d %d %.1f 0.0 %s %d %d %d",
-                      rq.generated, rq.prompt_len, rq.prompt_ms, reason,
-                      rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
+                proto("DONE %d %d %.1f 0.0 %s", rq.generated, rq.prompt_len, rq.prompt_ms, reason);
                 proto("BADM %d 0", rq.slot);
             } else {
                 char dstr[64] = "";
@@ -575,49 +470,64 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         rq.prompt_len = static_cast<int>(rq.prompt_ids.size());
-        if (rq.prompt_len <= 0 || rq.prompt_len >= eff_max_ctx) {
-            err = "prompt length out of range (1.." + std::to_string(eff_max_ctx - 1) + ")";
+        if (rq.prompt_len <= 0 || rq.prompt_len >= cfg.bopts.max_ctx) {
+            err = "prompt length out of range (1.." + std::to_string(cfg.bopts.max_ctx - 1) + ")";
             rq.active = false;
             return false;
         }
-        // Prefix reuse check (#6627): prefer full cached_prefix match, else restore prompt-end checkpoint!
-        // Because prompt_ckpt_prefix is saved at prompt_len - 1 before generation, BOTH multi-turn follow-ups
-        // (even if hidden thinking or stop tokens differed) AND exact repeats reuse the full prior prompt!
-        int reuse = 0;
-        bool used_ckpt = false;
-        if (pg.images.empty()) {
-            int full_match = 0;
-            if (!rq.cached_prefix.empty() && static_cast<int>(rq.cached_prefix.size()) < rq.prompt_len) {
-                const int clen = static_cast<int>(rq.cached_prefix.size());
-                int m = 0;
-                while (m < clen && rq.cached_prefix[m] == rq.prompt_ids[m]) ++m;
-                if (m == clen) full_match = clen;
-            }
-            int ckpt_match = 0;
-            if (!rq.prompt_ckpt_prefix.empty() && static_cast<int>(rq.prompt_ckpt_prefix.size()) < rq.prompt_len) {
-                const int plen = static_cast<int>(rq.prompt_ckpt_prefix.size());
-                int m = 0;
-                while (m < plen && rq.prompt_ckpt_prefix[m] == rq.prompt_ids[m]) ++m;
-                if (m == plen) ckpt_match = plen;
-            }
-            if (full_match > 0 && full_match >= ckpt_match) {
-                reuse = full_match;
-            } else if (ckpt_match > 0 && backend.restore_prompt_checkpoint(rq.slot, ckpt_match)) {
-                reuse = ckpt_match;
-                rq.cached_prefix = rq.prompt_ckpt_prefix;
-                used_ckpt = true;
+        // Compute bit-exact snapshot boundary right after the last <|end_message|> (200005) near prompt end
+        rq.snap_target = 0;
+        if (pg.images.empty() && rq.prompt_len >= 64) {
+            rq.snap_target = rq.prompt_len;
+            for (int back = 0; back < 8 && (rq.prompt_len - 1 - back) >= 64; ++back) {
+                if (rq.prompt_ids[rq.prompt_len - 1 - back] == 200005) {
+                    rq.snap_target = rq.prompt_len - back;
+                    break;
+                }
             }
         }
-        (void)used_ckpt;
+
+        // Prefix reuse check (exact continuation, in-VRAM prefill checkpoint, or RAM-parked checkpoint!)
+        auto exact_prefix_match = [&](const std::vector<int32_t>& pfx) -> bool {
+            return !pfx.empty()
+                && static_cast<int>(pfx.size()) < rq.prompt_len
+                && std::equal(pfx.begin(), pfx.end(), rq.prompt_ids.begin());
+        };
+        int reuse = 0;
+        if (pg.images.empty()) {
+            if (exact_prefix_match(rq.cached_prefix)) {
+                reuse = static_cast<int>(rq.cached_prefix.size());
+            } else if (!rq.prefill_ckpt.has_global && exact_prefix_match(rq.prefill_ckpt.tokens)) {
+                if (backend.restore_prefix_checkpoint(rq.slot, rq.prefill_ckpt)) {
+                    reuse = rq.prefill_ckpt.pos;
+                    rq.cached_prefix = rq.prefill_ckpt.tokens;
+                }
+            } else if (parked_ckpt.has_global && exact_prefix_match(parked_ckpt.tokens)) {
+                if (backend.restore_prefix_checkpoint(rq.slot, parked_ckpt)) {
+                    reuse = parked_ckpt.pos;
+                    rq.cached_prefix = parked_ckpt.tokens;
+                    rq.prefill_ckpt.tokens = parked_ckpt.tokens;
+                    rq.prefill_ckpt.pos = parked_ckpt.pos;
+                    rq.prefill_ckpt.swa_buf = parked_ckpt.swa_buf;
+                    rq.prefill_ckpt.sconv_buf = parked_ckpt.sconv_buf;
+                    rq.prefill_ckpt.glob_buf.clear();
+                    rq.prefill_ckpt.has_global = false;
+                }
+            }
+        }
         if (reuse == 0) {
+            // Park current slot's long conversation KV in host RAM before resetting for an interrupting request!
+            if (rq.prefill_ckpt.pos >= 512 && !rq.prefill_ckpt.has_global && rq.prefill_ckpt.pos >= parked_ckpt.pos) {
+                if (backend.park_prefix_global_kv(rq.slot, rq.prefill_ckpt)) {
+                    parked_ckpt = std::move(rq.prefill_ckpt);
+                }
+            }
             backend.reset_slot(rq.slot);
             rq.cached_prefix.clear();
-            rq.prompt_ckpt_prefix.clear();
+            rq.prefill_ckpt.clear();
         } else {
             proto("RESUME %d", reuse);
         }
-        rq.reused_tokens = reuse;
-        rq.ckpt_pending = (pg.images.empty() && rq.prompt_len >= 16 && reuse < rq.prompt_len - 1);
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -631,14 +541,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         if (line == "QUIT") { quit_requested = true; return false; }
         if (line == "HELLO") {
             proto("HELLO ok engine=strata-inkling-%s arch=inkling2_loop backend=%s max_ctx=%d parallel=%d",
-                  cfg.version.c_str(), backend.backend_name(), eff_max_ctx, P);
+                  cfg.version.c_str(), backend.backend_name(), cfg.bopts.max_ctx, P);
             return true;
         }
         if (line == "STATS") {
             auto st = backend.stats();
             proto("STATS active_slots=%d max_slots=%d vram_experts=%zu ram_experts=%zu total_experts=%zu kv=%s",
                   st.active_slots, st.max_slots, st.vram_experts_loaded, st.ram_experts_loaded, st.total_experts,
-                  st.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16");
+                  kv_dtype_name(st.kv_dtype));
             return true;
         }
         if (line == "STOP") {
@@ -708,7 +618,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             } else if (pg.cmd == "BGEN" && pg.slot_read && pg.max_new > 0) {
                 // Zero-HoL admission: immediately release server.py control lines so concurrent
                 // HTTP requests 1..64 all prefill and decode together in the coalesced StepBatch!
-                proto("DONE 0 %d 0.0 0.0 admit 0 0 %d", reqs[pg.slot].prompt_len, reqs[pg.slot].reused_tokens);
+                proto("DONE 0 %d 0.0 0.0 admit", reqs[pg.slot].prompt_len);
                 proto("BADM %d 1", pg.slot);
                 reqs[pg.slot].admitted = true;
             }
@@ -759,13 +669,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             continue;
         }
 
-        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
+        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree / Block-8 speculative step (when decoding)
         if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
-            reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
-            reqs[sole_slot].cur_pos + 8 < eff_max_ctx) {
+            reqs[sole_slot].s.greedy() && reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
+            reqs[sole_slot].cur_pos + 8 < cfg.bopts.max_ctx) {
             auto& rq = reqs[sole_slot];
-            // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties, and headroom >= 12)
-            if (rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
+            // 2a. Zero-D2H fused greedy Beam Tree speculative step (when no penalties and headroom >= 12)
+            if (!rq.s.penalties() && rq.cur_pos + 12 < cfg.bopts.max_ctx) {
                 int32_t emitted[16]{};
                 int drafted = 0;
                 std::string serr;
@@ -835,18 +745,12 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 for (int i = 0; i <= nd; ++i) {
                     float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
                     if (!finite_logits(lg, V)) {
-                        // Never leave poisoned KV/ShortConv prefix cached across retries (#879)!
-                        rq.cached_prefix.clear();
-                        rq.prompt_ckpt_prefix.clear();
-                        backend.reset_slot(rq.slot);
+                        backend.rollback_slot(rq.slot, rq.cur_pos);
                         finish_req(rq, "nonfinite");
                         done = true;
                         break;
                     }
-                    bool draft_ok = false;
-                    int32_t tok = (i < nd)
-                        ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
-                        : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+                    int32_t tok = sample_logits(lg, V, rq.s, rq.hist, rq.rng);
                     rq.hist.push_back(tok);
                     rq.gen_ids.push_back(tok);
                     rq.cached_prefix.push_back(i == 0 ? rq.next_tok : draft_ids[i - 1]);
@@ -858,7 +762,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     if (is_stop_tok(tok)) { fin = "stop"; done = true; ++accepted; break; }
                     if (rq.generated >= rq.max_new) { fin = "length"; done = true; ++accepted; break; }
                     if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; ++accepted; break; }
-                    if (i < nd && draft_ok) {
+                    if (i < nd && tok == draft_ids[i]) {
                         ++accepted;
                         ++rq.drafts_accepted;
                     } else {
@@ -894,10 +798,6 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         for (int s = 0; s < P; ++s) {
             auto& rq = reqs[s];
             if (!rq.active || rq.prefill_pos < rq.prompt_len) continue;
-            if (rq.cur_pos >= eff_max_ctx) {
-                finish_req(rq, "length");
-                continue;
-            }
             batch.push(s, rq.cur_pos, rq.next_tok, true);
             logit_slots.push_back(s);
             --token_budget;
@@ -913,9 +813,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     auto& rq = reqs[s];
                     const int rem = rq.prompt_len - rq.prefill_pos;
                     int take = std::min(rem, per_slot);
-                    // #6627: Pause 1 token before prompt_len so we save the exact prompt-end checkpoint at prompt_len - 1!
-                    if (rq.ckpt_pending && rq.prefill_pos < rq.prompt_len - 1 && rq.prefill_pos + take >= rq.prompt_len) {
-                        take = (rq.prompt_len - 1) - rq.prefill_pos;
+                    if (rq.snap_target > rq.prefill_pos && rq.prefill_pos + take > rq.snap_target) {
+                        take = rq.snap_target - rq.prefill_pos;
                     }
                     const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
                     if (!rq.img_embeds.empty()) {
@@ -943,7 +842,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
         const double step_ms = (now_s() - t_step0) * 1000.0;
 
-        // Update prefill progress & emit PP lines (+ save prompt-end checkpoint at prompt_len - 1 for #6627!)
+        // Update prefill progress & emit PP lines
         for (int s = 0; s < P; ++s) {
             if (prefill_fed[s] > 0) {
                 auto& rq = reqs[s];
@@ -951,10 +850,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.prefill_pos += prefill_fed[s];
                 rq.cur_pos = rq.prefill_pos;
                 rq.prompt_ms += step_ms;
-                if (rq.ckpt_pending && rq.prefill_pos == rq.prompt_len - 1) {
-                    rq.ckpt_pending = false;
-                    if (backend.save_prompt_checkpoint(rq.slot, rq.prefill_pos)) {
-                        rq.prompt_ckpt_prefix.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.prefill_pos);
+                if (rq.snap_target > 0 && rq.prefill_pos == rq.snap_target && rq.img_embeds.empty() && rq.snap_target > rq.prefill_ckpt.pos) {
+                    if (backend.save_prefix_checkpoint(s, rq.snap_target, rq.prefill_ckpt)) {
+                        rq.prefill_ckpt.tokens.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.snap_target);
                     }
                 }
                 if (rq.is_solo || !rq.admitted) {
@@ -970,9 +868,6 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             auto& rq = reqs[s];
             float* lg = logits_buf.data() + static_cast<size_t>(wi) * V;
             if (!finite_logits(lg, V)) {
-                // Purge poisoned KV/ShortConv state so subsequent retries start clean (#879)!
-                rq.cached_prefix.clear();
-                backend.reset_slot(rq.slot);
                 finish_req(rq, "nonfinite");
                 continue;
             }
@@ -992,7 +887,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             ++rq.generated;
 
             const bool stop = is_stop_tok(tok);
-            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= eff_max_ctx);
+            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= cfg.bopts.max_ctx);
             const bool hit_hold = (rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget && tok != rq.s.hold_token_id);
             const bool hit_loop = cfg.anti_loop && detect_repetition_loop(rq.gen_ids);
 
@@ -1016,7 +911,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     const bool cont = !(stop || hit_len || hit_hold || hit_loop);
                     if (!rq.slot_read) proto("T %d", tok);
                     const char* fin = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "stop" : "admit";
-                    proto("DONE %d %d %.1f 0.0 %s 0 0 %d", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin, rq.reused_tokens);
+                    proto("DONE %d %d %.1f 0.0 %s", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin);
                     proto("BADM %d %d", rq.slot, cont ? 1 : 0);
                     if (rq.slot_read) proto("BT %d %d", rq.slot, tok);
                     rq.admitted = true;

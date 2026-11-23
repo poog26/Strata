@@ -361,9 +361,8 @@ def clean_shared_defaults(d, hy4: bool = False) -> dict:
                 value = "max"
             elif hy4 and value == "no_think":
                 value = "none"
-            if value not in ("none", "low", "medium", "high") + (("max",) if hy4 else ()):    # Hy4's template also has max
-                raise ValueError("reasoning_effort: none, low, medium, high or max" if hy4
-                                 else "reasoning_effort: none, low, medium or high")
+            if value not in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+                raise ValueError("reasoning_effort: none, minimal, low, medium, high, xhigh or max")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

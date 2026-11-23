@@ -1234,6 +1234,8 @@ class StrataEngine:
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+        elif self.reused:                                 # RESUME <N> from strata-inkling 6-field DONE
+            self.last["reused"] = self.reused
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
@@ -5177,9 +5179,10 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         if self.hy4:                                   # Hy4's template reads reasoning_effort no_think | high | max (serve/hy4_dialect.py)
             return self.template.render(messages, tools=tools, **hy4_dialect.template_kwargs(kwargs))
-        if self.inkling:                               # Inkling-2-Mini: skip hidden <|content_thinking|> at the prompt boundary (#6612, #6620, #6627)
-            rendered = self.template.render(inkling_dialect.prepare_messages(messages), tools=tools, **inkling_dialect.template_kwargs(kwargs))
-            return inkling_dialect.finish_prompt(rendered, has_tools=bool(tools))
+        if self.inkling:                               # Inkling-2-Mini: honor reasoning_effort (skip finish_prompt when thinking is on)
+            tkw = inkling_dialect.template_kwargs(kwargs)
+            rendered = self.template.render(inkling_dialect.prepare_messages(messages), tools=tools, **tkw)
+            return rendered if tkw.get("enable_thinking") else inkling_dialect.finish_prompt(rendered, has_tools=bool(tools))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
