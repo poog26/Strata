@@ -130,16 +130,16 @@ inline int32_t sample_logits(float* lg, int V, const SampleOpts& s, const std::v
 }
 
 inline bool finite_logits(const float* lg, int V) noexcept {
-    for (int i = 0; i < V; i += 67) if (!std::isfinite(lg[i])) return false;
+    for (int i = 0; i < V; ++i) if (!std::isfinite(lg[i])) return false;
     return true;
 }
 
-// Anti-loop repetition detector: detects pathological n-gram stalling (exact period 1..32 repeated >= 8x)
+// Anti-loop repetition detector: detects pathological n-gram stalling (exact period 1..32 covering >= 256 tokens and >= 8x)
 inline bool detect_repetition_loop(const std::vector<int32_t>& gen_ids) noexcept {
     const size_t n = gen_ids.size();
-    if (n < 64) return false;
+    if (n < 256) return false;
     for (size_t period = 1; period <= 32; ++period) {
-        const size_t need_reps = (period <= 4) ? 16 : 6;
+        const size_t need_reps = std::max<size_t>(8, (256 + period - 1) / period);
         if (n < period * need_reps) continue;
         bool match = true;
         for (size_t k = 0; k < period * (need_reps - 1); ++k) {
@@ -328,6 +328,7 @@ struct ActiveReq {
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
     int snap_target = 0;                 // boundary token position for bit-exact SWA+ShortConv prefix checkpoint
+    int reused_tokens = 0;               // prefix tokens reused on this request (emitted on 9-field DONE)
     InkBackend::PrefixCheckpoint prefill_ckpt;
     double t_start = 0.0;
     double prompt_ms = 0.0;
@@ -355,6 +356,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
     const int chunk_sz = std::max(1, cfg.bopts.chunk);
     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present;
+    const int eff_max_ctx = (backend.effective_max_ctx() > 0)
+        ? std::min(cfg.bopts.max_ctx, backend.effective_max_ctx())
+        : cfg.bopts.max_ctx;
 
     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
     bool images_ok = false;
@@ -369,7 +373,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     // Allocate all P slots (lazy paged KV uses near-zero memory until populated!)
     for (int s = 0; s < P; ++s) {
         std::string aerr;
-        if (!backend.alloc_slot(s, cfg.bopts.max_ctx, cfg.bopts.kv_dtype, aerr)) {
+        if (!backend.alloc_slot(s, eff_max_ctx, cfg.bopts.kv_dtype, aerr)) {
             proto("ERR alloc_slot %d: %s", s, aerr.c_str());
             return 1;
         }
@@ -383,39 +387,42 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
           P, kv_dtype_name(cfg.bopts.kv_dtype),
           use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
-    proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
+    proto("READY %d stop hold holdb", eff_max_ctx);
 
     std::vector<ActiveReq> reqs(P);
-    // Multi-context KV pool: packs parked conversations in the empty tail [active_end .. max_ctx) of the
-    // already-allocated VRAM Global KV buffer (~1 ms D2D swap, zero extra VRAM) with automatic host RAM LRU overflow!
+    // Multi-context KV pool: packs parked conversations & N-level branch points in the empty tail
+    // [active_end .. eff_max_ctx) of the already-allocated VRAM Global KV buffer (~1 ms D2D swap,
+    // zero extra VRAM) with automatic host RAM LRU overflow!
     std::vector<InkBackend::PrefixCheckpoint> kv_pool;
     uint64_t pool_clock = 0;
     constexpr size_t kMaxPoolEntries = 8;
     constexpr size_t kMaxPoolRamBytes = 1024ull << 20;
 
-    auto enforce_pool_limits = [&]() {
+    auto enforce_pool_limits = [&](uint64_t protect_tick = 0) {
         auto total_ram = [&]() {
             size_t s = 0;
             for (const auto& e : kv_pool) s += e.ram_bytes();
             return s;
         };
         while (kv_pool.size() > kMaxPoolEntries || (kv_pool.size() > 1 && total_ram() > kMaxPoolRamBytes)) {
-            size_t oldest = 0;
-            for (size_t i = 1; i < kv_pool.size(); ++i) {
-                if (kv_pool[i].lru_tick < kv_pool[oldest].lru_tick) oldest = i;
+            int oldest = -1;
+            for (size_t i = 0; i < kv_pool.size(); ++i) {
+                if (protect_tick != 0 && kv_pool[i].lru_tick == protect_tick) continue;
+                if (oldest < 0 || kv_pool[i].lru_tick < kv_pool[oldest].lru_tick) oldest = static_cast<int>(i);
             }
+            if (oldest < 0) break;
             kv_pool.erase(kv_pool.begin() + oldest);
         }
     };
 
     auto alloc_vram_tail = [&](int need_len, int min_pos) -> int {
-        if (P != 1 || need_len <= 0 || min_pos + need_len > cfg.bopts.max_ctx) return -1;
+        if (P != 1 || need_len <= 0 || min_pos + need_len > eff_max_ctx) return -1;
         std::vector<std::pair<int, int>> used;
         for (const auto& e : kv_pool) {
             if (e.vram_off >= 0 && e.pos > 0) used.emplace_back(e.vram_off, e.vram_off + e.pos);
         }
         std::sort(used.begin(), used.end());
-        int hi = cfg.bopts.max_ctx;
+        int hi = eff_max_ctx;
         for (int i = static_cast<int>(used.size()) - 1; i >= 0; --i) {
             const int lo = std::max(min_pos, used[i].second);
             if (hi - lo >= need_len) return hi - need_len;
@@ -425,7 +432,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         return -1;
     };
 
-    auto evict_vram_tail_below = [&](int min_free_pos) {
+    auto evict_vram_tail_below = [&](int min_free_pos, uint64_t protect_tick = 0) {
         if (P != 1 || kv_pool.empty()) return;
         bool changed = false;
         for (size_t i = 0; i < kv_pool.size(); ) {
@@ -444,39 +451,40 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 ++i;
             }
         }
-        if (changed) enforce_pool_limits();
+        if (changed) enforce_pool_limits(protect_tick);
+    };
+
+    auto park_ckpt_to_pool = [&](int slot, InkBackend::PrefixCheckpoint&& ckpt, int next_need_pos, uint64_t protect_tick = 0) {
+        if (P != 1 || slot != 0 || ckpt.pos < 128 || ckpt.has_global || ckpt.vram_off >= 0) return;
+        // Deduplicate ONLY exact same token sequence (preserve shorter ancestors as N-level branch points!)
+        for (auto& e : kv_pool) {
+            if (e.tokens.size() == ckpt.tokens.size() && e.tokens == ckpt.tokens) {
+                e.lru_tick = ++pool_clock;
+                return;
+            }
+        }
+        const int min_pos = std::max(ckpt.pos, next_need_pos);
+        const int off = alloc_vram_tail(ckpt.pos, min_pos);
+        if (off >= 0 && backend.copy_global_kv_vram(slot, 0, off, ckpt.pos)) {
+            ckpt.vram_off = off;
+            ckpt.release_glob_buf();
+            ckpt.lru_tick = ++pool_clock;
+            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in VRAM tail [%d..%d) (pool=%zu)\n",
+                         ckpt.pos, off, off + ckpt.pos, kv_pool.size() + 1);
+            kv_pool.push_back(std::move(ckpt));
+            enforce_pool_limits(protect_tick);
+        } else if (backend.park_prefix_global_kv(slot, ckpt)) {
+            ckpt.lru_tick = ++pool_clock;
+            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in host RAM (%.1f MiB, pool=%zu)\n",
+                         ckpt.pos, (double)ckpt.glob_buf.size() / (1024.0 * 1024.0), kv_pool.size() + 1);
+            kv_pool.push_back(std::move(ckpt));
+            enforce_pool_limits(protect_tick);
+        }
     };
 
     auto park_active_to_pool = [&](ActiveReq& rq, int next_need_pos, uint64_t protect_tick = 0) {
-        if (P != 1 || rq.slot != 0 || rq.prefill_ckpt.pos < 128 || rq.prefill_ckpt.has_global || rq.prefill_ckpt.vram_off >= 0) return;
-        // Supersede any older checkpoint of the SAME conversation already in kv_pool
-        for (size_t i = 0; i < kv_pool.size(); ) {
-            const auto& e = kv_pool[i];
-            if (e.lru_tick != protect_tick && !e.tokens.empty() && e.tokens.size() <= rq.prefill_ckpt.tokens.size()
-                && std::equal(e.tokens.begin(), e.tokens.end(), rq.prefill_ckpt.tokens.begin())) {
-                kv_pool.erase(kv_pool.begin() + i);
-            } else {
-                ++i;
-            }
-        }
-        const int min_pos = std::max(rq.prefill_ckpt.pos, next_need_pos);
-        const int off = alloc_vram_tail(rq.prefill_ckpt.pos, min_pos);
-        if (off >= 0 && backend.copy_global_kv_vram(rq.slot, 0, off, rq.prefill_ckpt.pos)) {
-            rq.prefill_ckpt.vram_off = off;
-            rq.prefill_ckpt.has_global = false;
-            rq.prefill_ckpt.glob_buf.clear();
-            rq.prefill_ckpt.lru_tick = ++pool_clock;
-            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in VRAM tail [%d..%d) (pool=%zu)\n",
-                         rq.prefill_ckpt.pos, off, off + rq.prefill_ckpt.pos, kv_pool.size() + 1);
-            kv_pool.push_back(std::move(rq.prefill_ckpt));
-            enforce_pool_limits();
-        } else if (backend.park_prefix_global_kv(rq.slot, rq.prefill_ckpt)) {
-            rq.prefill_ckpt.lru_tick = ++pool_clock;
-            std::fprintf(stderr, "[InkCUDA] KV pool: parked %d tok in host RAM (%.1f MiB, pool=%zu)\n",
-                         rq.prefill_ckpt.pos, (double)rq.prefill_ckpt.glob_buf.size() / (1024.0 * 1024.0), kv_pool.size() + 1);
-            kv_pool.push_back(std::move(rq.prefill_ckpt));
-            enforce_pool_limits();
-        }
+        park_ckpt_to_pool(rq.slot, std::move(rq.prefill_ckpt), next_need_pos, protect_tick);
+        rq.prefill_ckpt.clear();
     };
 
     std::unordered_map<std::string, int> req_id_to_slot;
@@ -490,13 +498,17 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     auto finish_req = [&](ActiveReq& rq, const char* reason) {
         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
         if (rq.is_solo) {
-            proto("DONE %d %d %.1f %.1f %s", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
+            proto("DONE %d %d %.1f %.1f %s %d %d %d",
+                  rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
         } else if (rq.is_ext_gen) {
             proto("DONE %s %d %d %.1f %.1f %s", rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
             req_id_to_slot.erase(rq.req_id);
         } else {
             if (!rq.admitted) {
-                proto("DONE %d %d %.1f 0.0 %s", rq.generated, rq.prompt_len, rq.prompt_ms, reason);
+                proto("DONE %d %d %.1f 0.0 %s %d %d %d",
+                      rq.generated, rq.prompt_len, rq.prompt_ms, reason,
+                      rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
                 proto("BADM %d 0", rq.slot);
             } else {
                 char dstr[64] = "";
@@ -516,10 +528,20 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.max_new = pg.max_new;
         rq.generated = 0;
         rq.s = pg.s;
-        rq.rng.seed(pg.s.seed ? pg.s.seed : 20261121ULL);
+        {
+            uint64_t seed_val = pg.s.seed;
+            if (seed_val == 0) {
+                std::random_device rd;
+                const uint64_t t = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+                seed_val = ((static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd())) ^ (t * 0x9e3779b97f4a7c15ULL);
+                if (seed_val == 0) seed_val = 1ULL;
+            }
+            rq.rng.seed(seed_val);
+        }
         rq.cancelled = false;
         rq.admitted = false;
         rq.slot_read = pg.slot_read;
+        rq.reused_tokens = 0;
         rq.drafts_offered = 0;
         rq.drafts_accepted = 0;
         rq.t_start = now_s();
@@ -562,77 +584,116 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         rq.prompt_len = static_cast<int>(rq.prompt_ids.size());
-        if (rq.prompt_len <= 0 || rq.prompt_len >= cfg.bopts.max_ctx) {
-            err = "prompt length out of range (1.." + std::to_string(cfg.bopts.max_ctx - 1) + ")";
+        if (rq.prompt_len <= 0 || rq.prompt_len >= eff_max_ctx) {
+            err = "prompt length out of range (1.." + std::to_string(eff_max_ctx - 1) + ")";
             rq.active = false;
             return false;
         }
-        // Compute bit-exact snapshot boundary right after the last <|end_message|> (200005) near prompt end
+        // Compute bit-exact snapshot boundary right after the last <|end_message|> (200010) before any
+        // trailing assistant opener (e.g. <|message_model|><|content_text|> or empty-think opener
+        // <|message_model|><|content_thinking|><|end_message|>), and clamp to prompt_len - 1 so identical
+        // retries ALWAYS match!
         rq.snap_target = 0;
         if (pg.images.empty() && rq.prompt_len >= 64) {
-            rq.snap_target = rq.prompt_len;
-            for (int back = 0; back < 8 && (rq.prompt_len - 1 - back) >= 64; ++back) {
-                if (rq.prompt_ids[rq.prompt_len - 1 - back] == 200005) {
-                    rq.snap_target = rq.prompt_len - back;
+            constexpr int32_t kMsgModel   = 200001;
+            constexpr int32_t kContentTxt = 200004;
+            constexpr int32_t kContentThk = 200008;
+            constexpr int32_t kEndMessage = 200010;
+            int end_scan = rq.prompt_len;
+            if (end_scan >= 67 &&
+                rq.prompt_ids[end_scan - 3] == kMsgModel &&
+                rq.prompt_ids[end_scan - 2] == kContentThk &&
+                rq.prompt_ids[end_scan - 1] == kEndMessage) {
+                end_scan -= 3;
+            } else {
+                for (int s = 0; s < 4 && end_scan > 64; ++s) {
+                    const int32_t t = rq.prompt_ids[end_scan - 1];
+                    if (t == kContentTxt || t == kContentThk || t == kMsgModel) --end_scan;
+                    else break;
+                }
+            }
+            rq.snap_target = end_scan;
+            for (int back = 0; back < 8 && (end_scan - 1 - back) >= 64; ++back) {
+                if (rq.prompt_ids[end_scan - 1 - back] == kEndMessage) {
+                    rq.snap_target = end_scan - back;
                     break;
                 }
             }
+            rq.snap_target = std::min(rq.snap_target, rq.prompt_len - 1);
         }
 
-        // Prefix reuse check (exact continuation, in-VRAM prefill checkpoint, or multi-context VRAM-tail/RAM pool!)
+        // Prefix reuse check: pick the LONGEST exact match across active cached_prefix, active prefill_ckpt,
+        // and EVERY parked entry in kv_pool! (Tie-break prefers in-slot > in-slot ckpt > kv_pool.)
         auto exact_prefix_match = [&](const std::vector<int32_t>& pfx) -> bool {
             return !pfx.empty()
                 && static_cast<int>(pfx.size()) < rq.prompt_len
                 && std::equal(pfx.begin(), pfx.end(), rq.prompt_ids.begin());
         };
-        const int active_need = std::min(cfg.bopts.max_ctx, rq.prompt_len + std::min(rq.max_new, 2048));
+        const int active_need = std::min(eff_max_ctx, rq.prompt_len + std::min(rq.max_new, 2048));
         int reuse = 0;
         if (pg.images.empty()) {
+            enum class BestSrc { None, ActiveCached, ActiveCkpt, Pool };
+            BestSrc best_src = BestSrc::None;
+            int best_len = 0;
+            int best_pool_idx = -1;
+
             if (exact_prefix_match(rq.cached_prefix)) {
-                reuse = static_cast<int>(rq.cached_prefix.size());
+                best_src = BestSrc::ActiveCached;
+                best_len = static_cast<int>(rq.cached_prefix.size());
+            }
+            if (!rq.prefill_ckpt.has_global && rq.prefill_ckpt.vram_off < 0 && exact_prefix_match(rq.prefill_ckpt.tokens)) {
+                if (rq.prefill_ckpt.pos > best_len) {
+                    best_src = BestSrc::ActiveCkpt;
+                    best_len = rq.prefill_ckpt.pos;
+                }
+            }
+            if (P == 1 && !kv_pool.empty()) {
+                for (size_t i = 0; i < kv_pool.size(); ++i) {
+                    if (exact_prefix_match(kv_pool[i].tokens) && kv_pool[i].pos > best_len) {
+                        best_src = BestSrc::Pool;
+                        best_len = kv_pool[i].pos;
+                        best_pool_idx = static_cast<int>(i);
+                    }
+                }
+            }
+
+            if (best_src == BestSrc::ActiveCached) {
+                reuse = best_len;
                 evict_vram_tail_below(active_need);
-            } else if (!rq.prefill_ckpt.has_global && rq.prefill_ckpt.vram_off < 0 && exact_prefix_match(rq.prefill_ckpt.tokens)) {
+            } else if (best_src == BestSrc::ActiveCkpt) {
+                evict_vram_tail_below(std::max(active_need, rq.prefill_ckpt.pos));
                 if (backend.restore_prefix_checkpoint(rq.slot, rq.prefill_ckpt)) {
                     reuse = rq.prefill_ckpt.pos;
                     rq.cached_prefix = rq.prefill_ckpt.tokens;
-                    evict_vram_tail_below(active_need);
                 }
-            } else if (P == 1 && !kv_pool.empty()) {
-                // Find longest matching conversation in multi-context KV pool
-                int best_idx = -1;
+            } else if (best_src == BestSrc::Pool && best_pool_idx >= 0) {
+                const uint64_t target_tick = kv_pool[best_pool_idx].lru_tick;
+                const int restore_need = std::max(active_need, kv_pool[best_pool_idx].pos);
+                // Park the currently active conversation first while protecting `target_tick`
+                park_active_to_pool(rq, restore_need, target_tick);
+                // Locate target again (indices may have shifted)
+                int ti = -1;
                 for (size_t i = 0; i < kv_pool.size(); ++i) {
-                    if (exact_prefix_match(kv_pool[i].tokens)) {
-                        if (best_idx < 0 || kv_pool[i].pos > kv_pool[best_idx].pos) best_idx = static_cast<int>(i);
-                    }
+                    if (kv_pool[i].lru_tick == target_tick) { ti = static_cast<int>(i); break; }
                 }
-                if (best_idx >= 0) {
-                    const uint64_t target_tick = kv_pool[best_idx].lru_tick;
-                    // Park the currently active conversation first while protecting `target_tick`
-                    park_active_to_pool(rq, active_need, target_tick);
-                    // Locate target again (indices may have shifted if an older entry was superseded)
-                    int ti = -1;
-                    for (size_t i = 0; i < kv_pool.size(); ++i) {
-                        if (kv_pool[i].lru_tick == target_tick) { ti = static_cast<int>(i); break; }
+                if (ti >= 0) {
+                    auto target = std::move(kv_pool[ti]);
+                    kv_pool.erase(kv_pool.begin() + ti);
+                    // If target's VRAM range overlaps [0..target.pos), bounce target to RAM first
+                    if (target.vram_off >= 0 && target.vram_off < target.pos) {
+                        backend.park_prefix_global_kv_at(0, target.vram_off, target);
                     }
-                    if (ti >= 0) {
-                        auto target = std::move(kv_pool[ti]);
-                        kv_pool.erase(kv_pool.begin() + ti);
-                        // If target's VRAM range overlaps [0..target.pos), bounce through RAM safely
-                        if (target.vram_off >= 0 && target.vram_off < target.pos) {
-                            backend.park_prefix_global_kv_at(0, target.vram_off, target);
-                        }
-                        const bool from_vram = (target.vram_off >= 0);
-                        if (backend.restore_prefix_checkpoint(rq.slot, target)) {
-                            std::fprintf(stderr, "[InkCUDA] KV pool: restored %d tok from %s (pool=%zu)\n",
-                                         target.pos, from_vram ? "VRAM tail" : "host RAM", kv_pool.size());
-                            reuse = target.pos;
-                            rq.cached_prefix = target.tokens;
-                            rq.prefill_ckpt = std::move(target);
-                            rq.prefill_ckpt.vram_off = -1;
-                            rq.prefill_ckpt.has_global = false;
-                            rq.prefill_ckpt.glob_buf.clear();
-                            evict_vram_tail_below(active_need);
-                        }
+                    // Evict any OTHER parked conversation sitting in [0..max(active_need, target.pos)) BEFORE overwriting [0..target.pos)!
+                    evict_vram_tail_below(std::max(active_need, target.pos));
+                    const bool from_vram = (target.vram_off >= 0);
+                    if (backend.restore_prefix_checkpoint(rq.slot, target)) {
+                        std::fprintf(stderr, "[InkCUDA] KV pool: restored %d tok from %s (pool=%zu)\n",
+                                     target.pos, from_vram ? "VRAM tail" : "host RAM", kv_pool.size());
+                        reuse = target.pos;
+                        rq.cached_prefix = target.tokens;
+                        rq.prefill_ckpt = std::move(target);
+                        rq.prefill_ckpt.vram_off = -1;
+                        rq.prefill_ckpt.release_glob_buf();
                     }
                 }
             }
@@ -647,6 +708,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         } else {
             proto("RESUME %d", reuse);
         }
+        rq.reused_tokens = reuse;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -660,7 +722,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         if (line == "QUIT") { quit_requested = true; return false; }
         if (line == "HELLO") {
             proto("HELLO ok engine=strata-inkling-%s arch=inkling2_loop backend=%s max_ctx=%d parallel=%d",
-                  cfg.version.c_str(), backend.backend_name(), cfg.bopts.max_ctx, P);
+                  cfg.version.c_str(), backend.backend_name(), eff_max_ctx, P);
             return true;
         }
         if (line == "STATS") {
@@ -671,7 +733,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             return true;
         }
         if (line == "STOP") {
-            for (auto& rq : reqs) if (rq.active && rq.is_solo) rq.cancelled = true;
+            for (auto& rq : reqs) if (rq.active && (rq.is_solo || P == 1)) rq.cancelled = true;
             return true;
         }
         if (line.rfind("BSTOP ", 0) == 0) {
@@ -791,10 +853,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree / Block-8 speculative step (when decoding)
         if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
             reqs[sole_slot].s.greedy() && reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
-            reqs[sole_slot].cur_pos + 8 < cfg.bopts.max_ctx) {
+            reqs[sole_slot].cur_pos + 8 < eff_max_ctx) {
             auto& rq = reqs[sole_slot];
+            if (P == 1 && !kv_pool.empty()) evict_vram_tail_below(rq.cur_pos + 32);
             // 2a. Zero-D2H fused greedy Beam Tree speculative step (when no penalties and headroom >= 12)
-            if (!rq.s.penalties() && rq.cur_pos + 12 < cfg.bopts.max_ctx) {
+            if (!rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
                 int32_t emitted[16]{};
                 int drafted = 0;
                 std::string serr;
@@ -864,7 +927,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 for (int i = 0; i <= nd; ++i) {
                     float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
                     if (!finite_logits(lg, V)) {
-                        backend.rollback_slot(rq.slot, rq.cur_pos);
+                        backend.reset_slot(rq.slot);
+                        rq.cached_prefix.clear();
+                        rq.prefill_ckpt.clear();
                         finish_req(rq, "nonfinite");
                         done = true;
                         break;
@@ -971,8 +1036,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.cur_pos = rq.prefill_pos;
                 rq.prompt_ms += step_ms;
                 if (rq.snap_target > 0 && rq.prefill_pos == rq.snap_target && rq.img_embeds.empty() && rq.snap_target > rq.prefill_ckpt.pos) {
-                    if (backend.save_prefix_checkpoint(s, rq.snap_target, rq.prefill_ckpt)) {
-                        rq.prefill_ckpt.tokens.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.snap_target);
+                    InkBackend::PrefixCheckpoint next_ckpt;
+                    if (backend.save_prefix_checkpoint(s, rq.snap_target, next_ckpt)) {
+                        next_ckpt.tokens.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.snap_target);
+                        if (P == 1 && rq.prefill_ckpt.pos >= 128 && !rq.prefill_ckpt.has_global && rq.prefill_ckpt.vram_off < 0) {
+                            const int cur_need = std::min(eff_max_ctx, rq.prompt_len + std::min(rq.max_new, 2048));
+                            park_ckpt_to_pool(s, std::move(rq.prefill_ckpt), cur_need);
+                        }
+                        rq.prefill_ckpt = std::move(next_ckpt);
                     }
                 }
                 if (rq.is_solo || !rq.admitted) {
@@ -988,6 +1059,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             auto& rq = reqs[s];
             float* lg = logits_buf.data() + static_cast<size_t>(wi) * V;
             if (!finite_logits(lg, V)) {
+                backend.reset_slot(rq.slot);
+                rq.cached_prefix.clear();
+                rq.prefill_ckpt.clear();
                 finish_req(rq, "nonfinite");
                 continue;
             }
@@ -1007,7 +1081,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             ++rq.generated;
 
             const bool stop = is_stop_tok(tok);
-            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= cfg.bopts.max_ctx);
+            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= eff_max_ctx);
             const bool hit_hold = (rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget && tok != rq.s.hold_token_id);
             const bool hit_loop = cfg.anti_loop && detect_repetition_loop(rq.gen_ids);
 

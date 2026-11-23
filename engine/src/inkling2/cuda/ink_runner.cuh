@@ -1056,7 +1056,7 @@ struct InkCudaRunner {
     }
 
     void ensure_pf_attn(int K_len) {
-        constexpr int Q_CH = 512;
+        constexpr int Q_CH = 256;
         if (K_len <= pf_kv_cap && d_pf_q) return;
         INK_CK(cudaStreamSynchronize(st));
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
@@ -1250,7 +1250,9 @@ struct InkCudaRunner {
                     (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
                     p0_val, d_attn_pm, d_attn_pl, d_attn_po, M);
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M);
-            } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60) && (d_pf_q != nullptr || [&](){ size_t vf=0,vt=0; cudaMemGetInfo(&vf,&vt); return vf > (480ull<<20); }())) {
+            } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60)
+                       && ((is_swa ? (p0_val + M - std::max(0, p0_val - kInkSwaWin + 1)) : (p0_val + M)) <= 2048)
+                       && (d_pf_q != nullptr || [&](){ size_t vf=0,vt=0; ink_cuda_mem_info(&vf,&vt); return vf > (220ull<<20); }())) {
                 // High-speed Causal/SWA-Sliced Tensor Core Prefill Attention (BF16 on sm_80+, FP16 on sm_60..75!)
                 const bool use_fp16_pf = (m.sm_cc < 80);
                 const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;

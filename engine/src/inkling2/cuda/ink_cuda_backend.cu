@@ -74,6 +74,8 @@ public:
 
     std::string device_info() const override { return dev_info_; }
 
+    int effective_max_ctx() const noexcept override { return eff_max_ctx_; }
+
     BackendStats stats() const override {
         BackendStats st{};
         if (initialized_) {
@@ -469,6 +471,16 @@ public:
         }
         const int N = batch.n_tokens;
         if (N <= 0) return true;
+        for (int i = 0; i < N; ++i) {
+            if (batch.slot_ids[i] < 0 || batch.slot_ids[i] >= max_slots_) {
+                err = "invalid slot index in forward_batch";
+                return false;
+            }
+            if (batch.pos[i] < 0 || batch.pos[i] >= runner_->max_ctx) {
+                err = "token position " + std::to_string(batch.pos[i]) + " out of range (max_ctx=" + std::to_string(runner_->max_ctx) + ")";
+                return false;
+            }
+        }
         tree_snap_ready_ = false;
         const int V = model_.man.c.vocab_unpadded;
 

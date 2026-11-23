@@ -51,6 +51,7 @@ public:
     virtual const char* backend_name() const noexcept = 0;
     virtual std::string device_info() const = 0;
     virtual BackendStats stats() const = 0;
+    virtual int effective_max_ctx() const noexcept { return 0; }
 
     // Load Section 1 trunk + DSpark + 3x loop-weighted Section 4 experts into device/host memory
     virtual bool init(const InkModelFile& model, const BackendOpts& opts, std::string& err) = 0;
@@ -74,9 +75,14 @@ public:
         std::vector<uint8_t> sconv_buf;
         std::vector<uint8_t> glob_buf;
         size_t ram_bytes() const noexcept { return swa_buf.size() + sconv_buf.size() + glob_buf.size(); }
+        void release_glob_buf() {
+            std::vector<uint8_t>().swap(glob_buf);
+            has_global = false;
+        }
         void clear() {
             tokens.clear(); pos = 0; has_global = false; vram_off = -1; lru_tick = 0;
-            swa_buf.clear(); sconv_buf.clear(); glob_buf.clear();
+            swa_buf.clear(); sconv_buf.clear();
+            std::vector<uint8_t>().swap(glob_buf);
         }
     };
     virtual bool save_prefix_checkpoint(int slot, int pos, PrefixCheckpoint& out) {

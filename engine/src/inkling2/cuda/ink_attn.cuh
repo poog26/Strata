@@ -48,7 +48,7 @@ struct InkKvVisitDesc {
 // Per-32-element symmetric 4-bit KV helpers (1 warp = 1 group of 32 dims; 4 groups per 128-dim head, 72 B/head!)
 __device__ __forceinline__ void ink_q4_write_head(float val, int d, uint8_t* dst64, __half* dst_sc4) {
     const float am = warp_max(fabsf(val));
-    const float sc = am > 0.0f ? (am * (1.0f / 7.5f)) : 1.0f;
+    const float sc = am > 0.0f ? (am * (1.0f / 7.5f)) : 0.0f;
     const float inv_sc = am > 0.0f ? (7.5f / am) : 0.0f;
     int q = __float2int_rn(val * inv_sc + 7.5f);
     q = max(0, min(15, q));
@@ -950,6 +950,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
     }
     __syncthreads();
     const float mg = sh[0];
+    __syncthreads();
 
     float lsum = (tid == 0) ? __expf(sk - mg) : 0.0f;
     for (int ki = tid; ki < K_len; ki += 256) {

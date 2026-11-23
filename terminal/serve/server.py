@@ -1335,8 +1335,9 @@ class StrataEngine:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            # the engine's sampled path keeps at most 64 candidates (128 on Inkling): 0 ("off") and wider lists use the cap
+            cap = 128 if inkling else 64
+            keys += f" top_k={tk if 1 <= tk <= cap else cap}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -5835,7 +5836,7 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                thinking_n += parser.state in ("reasoning", "rcall")
+                                thinking_n += (parser.state in ("reasoning", "rcall") or getattr(parser, "in_reasoning", False))
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
@@ -5876,7 +5877,7 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
-                                if budget and parser.state == "reasoning":
+                                if budget and (parser.state == "reasoning" or getattr(parser, "in_reasoning", False)):
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
                                     if thought >= budget and parser.clean and not detok.pending():
@@ -5961,21 +5962,26 @@ class Service:
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
+                                and not answered and not wrap and not opens
+                                and (parser.state == "reasoning" or getattr(parser, "in_reasoning", False))
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            close_text = (f"{inkling_dialect.END_MSG}{inkling_dialect.MSG_MODEL}{inkling_dialect.CONTENT_TEXT}"
+                                          if self.inkling else REASONING_CLOSE)
+                            extra = self.tok.encode(close_text, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)
-                                    thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
+                                    thinking_n += (parser.state in ("reasoning", "rcall") or getattr(parser, "in_reasoning", False))
+                                    piece = detok.push(t)
+                                    evs = (cut(parser.feed_token(piece, is_special=(t in inkling_special_ids)))
+                                           if inkling_special_ids is not None else cut(parser.feed(piece)))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
@@ -6042,7 +6048,11 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            if self.inkling:
+                                text = (f"\n\nI have thought enough; let me answer now.{inkling_dialect.END_MSG}"
+                                        + (force or f"{inkling_dialect.MSG_MODEL}{inkling_dialect.CONTENT_TEXT}"))
+                            else:
+                                text = REASONING_WRAP_UP + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -6055,8 +6065,10 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
-                            thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            thinking_n += (parser.state in ("reasoning", "rcall") or getattr(parser, "in_reasoning", False))
+                            piece = detok.push(t)
+                            evs = (cut(parser.feed_token(piece, is_special=(t in inkling_special_ids)))
+                                   if inkling_special_ids is not None else cut(parser.feed(piece)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev

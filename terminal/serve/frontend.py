@@ -3068,6 +3068,14 @@ class InklingOutputParser(JsonOutputParser):
         from serve import inkling_dialect
         self._dialect = inkling_dialect.InklingDialect()
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self._dialect.in_reasoning
+
+    @property
+    def clean(self) -> bool:
+        return super().clean and not self._dialect.buf and not self._dialect._end_ws
+
     def _dispatch(self, chunks: list[tuple[str, str]]) -> list[Event]:
         out: list[Event] = []
         for kind, chunk in chunks:

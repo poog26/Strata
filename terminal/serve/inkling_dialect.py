@@ -131,6 +131,10 @@ class InklingDialect:
         self.calls = 0
         self._in_think = False
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self.state in ("think", "think_end")
+
     def _tags_for(self):
         if self.state == "idle":
             return _IDLE_TAGS
@@ -370,10 +374,8 @@ class InklingDialect:
                     self.calls += 1
                 out.append(("content", rendered))
                 self._emitted_visible = True
-        elif reason == "length" and self.state in ("think", "think_end") and not self._emitted_visible and self._think_acc.strip():
-            # #6682: when max_tokens expires inside <|content_thinking|> before any visible answer or tool call,
-            # surface the truncated thinking in the reasoning channel instead of a silent empty 200 OK.
-            out.append(("reasoning", self._think_acc))
+        # Note: `_emit_typed` already streams `("reasoning", chunk)` live while in `think`, so do not re-emit
+        # `self._think_acc` on `reason == "length"` (which would duplicate the reasoning stream).
         self.header_acc = ""
         self.tool_acc = ""
         self._think_acc = ""
