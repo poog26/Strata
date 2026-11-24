@@ -57,8 +57,10 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps(
     const float* __restrict__ fuse_w,  // [4, 4] F32
     int row,
     const float* __restrict__ norm_w,  // [2304] F32
-    float* __restrict__ out,           // [M, 2304]
-    int M) {
+    float* __restrict__ out,           // [M, 2304] or [ring_cap, 2304]
+    int M,
+    int ring_p0 = 0,
+    int ring_cap = 0) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int tid = threadIdx.x;
@@ -73,7 +75,8 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps(
     }
     __syncthreads();
     const size_t off = (size_t)m * kInkHidden;
-    float* dst = out + off;
+    const size_t dst_row = (ring_cap > 0) ? (size_t)((ring_p0 + m) % ring_cap) : (size_t)m;
+    float* dst = out + dst_row * kInkHidden;
     float ss = 0.0f;
     for (int d = tid; d < kInkHidden; d += 256) {
         float v = sw[0] * tap0[off + d] + sw[1] * tap1[off + d] + sw[2] * tap2[off + d] + sw[3] * tap3[off + d];
@@ -85,55 +88,18 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps(
     for (int d = tid; d < kInkHidden; d += 256) dst[d] = dst[d] * inv * norm_w[d];
 }
 
-// Ring-buffered variant for compact d_f_rnn [frnn_cap, 2304] (saves 2.4 GiB at 256K ctx!)
-__global__ void __launch_bounds__(256) k_dspark_mix_taps_ring(
-    const float* __restrict__ tap0,
-    const float* __restrict__ tap1,
-    const float* __restrict__ tap2,
-    const float* __restrict__ tap3,
-    const float* __restrict__ fuse_w,
-    int row,
-    const float* __restrict__ norm_w,
-    float* __restrict__ out_ring,
-    int p0, int ring_cap, int M) {
-    const int m = blockIdx.x;
-    if (m >= M) return;
-    const int tid = threadIdx.x;
-    __shared__ float sw[4], sh[32];
-    if (tid == 0) {
-        const float* fw = fuse_w + row * 4;
-        float mx = fmaxf(fmaxf(fw[0], fw[1]), fmaxf(fw[2], fw[3]));
-        float e0 = expf(fw[0] - mx), e1 = expf(fw[1] - mx), e2 = expf(fw[2] - mx), e3 = expf(fw[3] - mx);
-        float inv = 1.0f / (e0 + e1 + e2 + e3);
-        sw[0] = e0 * inv; sw[1] = e1 * inv; sw[2] = e2 * inv; sw[3] = e3 * inv;
-    }
-    __syncthreads();
-    const size_t src_off = (size_t)m * kInkHidden;
-    const int dst_slot = (p0 + m) % ring_cap;
-    float* dst = out_ring + (size_t)dst_slot * kInkHidden;
-    float ss = 0.0f;
-    for (int d = tid; d < kInkHidden; d += 256) {
-        float v = sw[0] * tap0[src_off + d] + sw[1] * tap1[src_off + d] + sw[2] * tap2[src_off + d] + sw[3] * tap3[src_off + d];
-        dst[d] = v;
-        ss += v * v;
-    }
-    ss = block_sum(ss, sh);
-    const float inv = rsqrtf(ss / (float)kInkHidden + kInkRmsEps);
-    for (int d = tid; d < kInkHidden; d += 256) dst[d] = dst[d] * inv * norm_w[d];
-}
-
 // Non-causal DSpark Block-8 Attention: attends to committed ctx [c0..apos-1] + all B=8 draft tokens [0..B-1]!
-// Supports compact SWA-1025 ring buffers for layers 0 & 2 and elastic global KV for layer 1!
+// Reads apos from d_apos_ptr so the entire DSpark draft_block8 captures cleanly in a SINGLE CUDA Graph across all positions!
 __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float* __restrict__ q,          // [B, 24, 128]
     const float* __restrict__ kd,         // [B, 8, 128]
     const float* __restrict__ vd,         // [B, 8, 128]
-    const __half* __restrict__ ctx_k,     // [ctx_cap, 8, 128]
-    const __half* __restrict__ ctx_v,     // [ctx_cap, 8, 128]
+    const __half* __restrict__ ctx_k,     // [cap, 8, 128]
+    const __half* __restrict__ ctx_v,     // [cap, 8, 128]
     const int32_t* __restrict__ apos_ptr, // [1] committed context length
     bool is_swa,
     int swa_win,                          // 1025
-    int ctx_cap,
+    int ctx_cap,                          // ring buffer capacity for ctx_k / ctx_v
     int B,                                // 8
     float* __restrict__ out) {            // [B, 24, 128]
     const int b = blockIdx.y;
@@ -148,8 +114,8 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float scale = 0.08838834764831845f;
 
     const float4 qv = *(const float4*)(q + ((size_t)b * kInkHeads + h) * kInkHeadDim + lane * 4);
-    const int c0 = is_swa ? max(0, apos - swa_win + 1) : 0;
-    const int c_end = is_swa ? apos : min(apos, ctx_cap);
+    int c0 = is_swa ? max(0, apos - swa_win + 1) : 0;
+    if (ctx_cap > 0) c0 = max(c0, apos - ctx_cap + 1);
 
     float mw = -1e30f, lw = 0.0f;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -166,8 +132,8 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
         mw = mn;
     };
 
-    for (int kp = c0 + warp; kp < c_end; kp += 4) {
-        const int p_idx = is_swa ? (kp % ctx_cap) : kp;
+    for (int kp = c0 + warp; kp < apos; kp += 4) {
+        const int p_idx = (ctx_cap > 0) ? (kp % ctx_cap) : kp;
         const size_t base = ((size_t)p_idx * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         const uint2 k2 = *(const uint2*)(ctx_k + base);
         const uint2 v2 = *(const uint2*)(ctx_v + base);
@@ -574,17 +540,18 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep(
     const int32_t* __restrict__ prev_tok_ptr,
     const float* __restrict__ state,      // [256]
     const float* __restrict__ hidden,     // [2304]
-    const float* __restrict__ f_rnn_base, // [frnn_cap, 2304]
+    const float* __restrict__ f_rnn_base, // [f_rnn_cap, 2304]
     const int32_t* __restrict__ apos_ptr, // [1]
-    int frnn_cap,
+    int f_rnn_cap,
     const uint8_t* __restrict__ mw1_raw, int mw1_fmt,
     float* __restrict__ joint_out) {      // [5120]
     constexpr int R = kInkMarkovRank;
     const int tid = threadIdx.x;
     const int32_t pt = *prev_tok_ptr;
     const int apos = *apos_ptr;
-    const int fidx = (apos > 0 ? (apos - 1) : 0) % frnn_cap;
-    const float* ctx = f_rnn_base + (size_t)fidx * kInkHidden;
+    const int r_pos = (apos > 0 ? (apos - 1) : 0);
+    const int r_idx = (f_rnn_cap > 0) ? (r_pos % f_rnn_cap) : r_pos;
+    const float* ctx = f_rnn_base + (size_t)r_idx * kInkHidden;
 
     joint_out[tid] = state[tid];
     float mv = 0.0f;
@@ -756,9 +723,9 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep_batch(
     const int32_t* __restrict__ prev_toks, // [nw]
     const float* __restrict__ states,      // [nw, 256]
     const float* __restrict__ hidden,      // [2304]
-    const float* __restrict__ f_rnn_base,  // [frnn_cap, 2304]
+    const float* __restrict__ f_rnn_base,  // [f_rnn_cap, 2304]
     const int32_t* __restrict__ apos_ptr,  // [1]
-    int frnn_cap,
+    int f_rnn_cap,
     const uint8_t* __restrict__ mw1_raw, int mw1_fmt,
     float* __restrict__ joint_out,         // [nw, 5120]
     int nw) {
@@ -769,8 +736,9 @@ __global__ void __launch_bounds__(256) k_dspark_markov_prep_batch(
     const int tid = threadIdx.x;
     const int32_t pt = prev_toks[b];
     const int apos = *apos_ptr;
-    const int fidx = (apos > 0 ? (apos - 1) : 0) % frnn_cap;
-    const float* ctx = f_rnn_base + (size_t)fidx * kInkHidden;
+    const int r_pos = (apos > 0 ? (apos - 1) : 0);
+    const int r_idx = (f_rnn_cap > 0) ? (r_pos % f_rnn_cap) : r_pos;
+    const float* ctx = f_rnn_base + (size_t)r_idx * kInkHidden;
     float* jo = joint_out + (size_t)b * J;
 
     jo[tid] = states[(size_t)b * R + tid];
@@ -1052,16 +1020,14 @@ struct InkDSpark {
     InkCudaModel& m;
     bool ready = false;
     int max_ctx = 4096;
-    double last_pred_etok = 0.0;  // the last tree step: expected tokens (1 + sum of the kept paths' probabilities) and its node count
-    int last_m = 0;
     int K_cand = 256;  // reduced-vocab L2-cached candidate pool for Markov RNN
 
-    // Context KV cache for 3 DSpark layers (layers 0 & 2 = compact SWA-1025 rings; layer 1 = elastic global!) + compact f_rnn ring!
-    int ctx_cap[3] = {0, 0, 0};
-    int frnn_cap = 64;
+    // Context KV cache for 3 DSpark layers (ring-buffered!) + f_rnn [f_rnn_cap, 2304]
     __half* d_ctx_k[3] = {};
     __half* d_ctx_v[3] = {};
-    float*  d_f_rnn = nullptr;  // [frnn_cap, 2304] (fixed < 5 MiB regardless of max_ctx!)
+    int     ctx_cap[3] = {};
+    float*  d_f_rnn = nullptr;  // [f_rnn_cap, 2304]
+    int     f_rnn_cap = 0;
 
     // Working buffers for Block-8 forward
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
@@ -1124,49 +1090,19 @@ struct InkDSpark {
 
     InkDSpark(InkCudaRunner& runner) : r(runner), m(runner.m) {}
 
-    void init(int ctx, int k_cand = 512, int init_glob_ctx = 0) {
+    void init(int ctx, int k_cand = 512) {
         if (!m.man.has_dspark) return;
         max_ctx = ctx;
         K_cand = k_cand;
-        const int swa_cap = std::min(max_ctx, m.man.c.dspark_swa_win + std::max(r.max_batch, 64));
-        const int glob_init = (init_glob_ctx > 0) ? std::min(max_ctx, std::max(256, init_glob_ctx)) : std::min(max_ctx, 8192);
-        frnn_cap = std::max(64, r.max_batch + 32);
-
-        // Pre-check free VRAM so DSpark NEVER crashes with CUDA error 2 (exit 3) on tight 4-16 GB GPUs!
-        // Shrink initial global DSpark KV cap (8192 -> 2048 -> 512) before giving up (#6633)!
-        int eff_glob_init = glob_init;
-        {
-            size_t vf = 0, vt = 0;
-            if (ink_cuda_mem_info(&vf, &vt) == cudaSuccess) {
-                auto calc_need = [&](int gcap) -> size_t {
-                    size_t kv_need = 0;
-                    for (int il = 0; il < 3; ++il) {
-                        const int c = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : gcap;
-                        kv_need += (size_t)c * kInkKVHeads * kInkHeadDim * 4;
-                    }
-                    return kv_need + (size_t)frnn_cap * kInkHidden * 4 + (80ull << 20);
-                };
-                if (vf < calc_need(eff_glob_init) + (96ull << 20) && eff_glob_init > 2048) {
-                    eff_glob_init = 2048;
-                }
-                if (vf < calc_need(eff_glob_init) + (96ull << 20) && eff_glob_init > 512) {
-                    eff_glob_init = 512;
-                }
-                const size_t base_need = calc_need(eff_glob_init);
-                if (vf < base_need + (64ull << 20)) {
-                    std::fprintf(stderr, "[InkCUDA] Skipping DSpark drafter: tight VRAM (%.0f MiB free < %.0f MiB needed)\n",
-                                 (double)vf / 1048576.0, (double)(base_need + (64ull << 20)) / 1048576.0);
-                    ready = false;
-                    return;
-                }
-            }
-        }
+        // Ring-buffer DSpark's drafter KV & f_rnn so 100k-256k context costs ~36 MiB instead of 4+ GiB!
         for (int il = 0; il < 3; ++il) {
-            ctx_cap[il] = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : eff_glob_init;
+            const bool swa = (m.man.c.dspark_is_swa[il] != 0);
+            ctx_cap[il] = std::min(max_ctx, swa ? 2048 : 4096);
             d_ctx_k[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
             d_ctx_v[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
         }
-        d_f_rnn = dalloc<float>((size_t)frnn_cap * kInkHidden);
+        f_rnn_cap = std::min(max_ctx, 512);
+        d_f_rnn = dalloc<float>((size_t)f_rnn_cap * kInkHidden);
 
         const int B = kInkDsparkBlock;  // 8
         d_cur         = dalloc<float>(B * kInkHidden);
@@ -1396,48 +1332,9 @@ struct InkDSpark {
         r.linear(wn, X, Y, B);
     }
 
-    // Elastic growth for DSpark Global layer(s) (e.g. layer 1) as sequence length grows!
-    bool ensure_ctx_cap(int needed_pos) {
-        if (!ready || needed_pos <= 0) return true;
-        const int target = std::min(max_ctx, std::max(needed_pos, ((needed_pos + 8191) / 8192) * 8192));
-        bool grew = false;
-        for (int il = 0; il < 3; ++il) {
-            if (m.man.c.dspark_is_swa[il] != 0) continue;
-            if (target <= ctx_cap[il]) continue;
-            INK_CK(cudaStreamSynchronize(r.st));
-            const size_t new_elems = (size_t)target * kInkKVHeads * kInkHeadDim;
-            const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim * sizeof(__half);
-            __half *nk = nullptr, *nv = nullptr;
-            if (cudaMalloc(&nk, new_elems * sizeof(__half)) != cudaSuccess ||
-                cudaMalloc(&nv, new_elems * sizeof(__half)) != cudaSuccess) {
-                (void)cudaGetLastError();
-                if (nk) cudaFree(nk);
-                if (nv) cudaFree(nv);
-                std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global ctx %d -> %d; disabling DSpark gracefully\n",
-                             ctx_cap[il], target);
-                ready = false;
-                return false;
-            }
-            INK_CK(cudaMemcpy(nk, d_ctx_k[il], old_bytes, cudaMemcpyDeviceToDevice));
-            INK_CK(cudaMemcpy(nv, d_ctx_v[il], old_bytes, cudaMemcpyDeviceToDevice));
-            cudaFree(d_ctx_k[il]);
-            cudaFree(d_ctx_v[il]);
-            d_ctx_k[il] = nk;
-            d_ctx_v[il] = nv;
-            ctx_cap[il] = target;
-            grew = true;
-        }
-        if (grew) {
-            if (draft_graph) { cudaGraphExecDestroy(draft_graph); draft_graph = nullptr; }
-            if (beam_graph)  { cudaGraphExecDestroy(beam_graph);  beam_graph = nullptr; beam_graph_w = 0; }
-        }
-        return true;
-    }
-
     // Ingest target taps [4, M, 2304] at positions [p0 .. p0 + M - 1] into DSpark context KV & f_rnn (ZERO host sync!)
     void ingest_taps_from(float* const taps[4], int p0, int M) {
         if (!ready || M <= 0) return;
-        if (!ensure_ctx_cap(p0 + M)) return;
         for (int i = 0; i < M; ++i) h_pos_pin[i] = p0 + i;
         INK_CK(cudaMemcpyAsync(d_pos, h_pos_pin, (size_t)M * 4, cudaMemcpyHostToDevice, r.st));
         const float* fw = (const float*)m.trunk_ptr("dspark.fuse_weight");
@@ -1463,14 +1360,15 @@ struct InkDSpark {
             desc.k_f16 = d_ctx_k[il];
             desc.v_f16 = d_ctx_v[il];
             desc.cap_pos = ctx_cap[il];
-            desc.is_swa = (m.man.c.dspark_is_swa[il] != 0);
-            desc.kv_fmt = 0;
+            desc.is_swa = true;   // ring wrap p % ctx_cap[il]
+            desc.is_fp8 = false;
+            desc.is_k4v4 = false;
             k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);
         }
-        k_dspark_mix_taps_ring<<<M, 256, 0, r.st>>>(
+        k_dspark_mix_taps<<<M, 256, 0, r.st>>>(
             taps[0], taps[1], taps[2], taps[3], fw, 3,
             (const float*)m.trunk_ptr("dspark.markov_head.dflare_norm.weight"),
-            d_f_rnn, p0, frnn_cap, M);
+            d_f_rnn, M, p0, f_rnn_cap);
     }
 
     void ingest_taps(int p0, int M) {
@@ -1574,7 +1472,7 @@ struct InkDSpark {
         for (int s = 0; s < 7; ++s) {
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep<<<1, 256, 0, r.st>>>(
-                prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos, frnn_cap,
+                prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos, f_rnn_cap,
                 m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint, d_rnn_proj, 1);
             k_dspark_markov_gru_upd<<<1, 256, 0, r.st>>>(
@@ -1618,7 +1516,7 @@ struct InkDSpark {
             const int nw = (s == 0) ? 1 : beam_w;
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep_batch<<<nw, 256, 0, r.st>>>(
-                d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos, frnn_cap,
+                d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos, f_rnn_cap,
                 m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint_b, nw);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint_b, d_rnn_proj_b, nw);
             k_dspark_markov_gru_upd_batch<<<nw, 256, 0, r.st>>>(
@@ -1661,26 +1559,13 @@ struct InkDSpark {
         if (r.use_cuda_graph) {
             if (!draft_graph) {
                 cudaGraph_t gr = nullptr;
-                cudaError_t ce = cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal);
-                if (ce == cudaSuccess) {
-                    emit_draft_block8();
-                    ce = cudaStreamEndCapture(r.st, &gr);
-                    if (ce == cudaSuccess && gr) {
-                        ce = cudaGraphInstantiate(&draft_graph, gr, nullptr, nullptr, 0);
-                        cudaGraphDestroy(gr);
-                    }
-                }
-                if (ce != cudaSuccess || !draft_graph) {
-                    (void)cudaGetLastError();
-                    if (draft_graph) { cudaGraphExecDestroy(draft_graph); draft_graph = nullptr; }
-                    r.use_cuda_graph = false;
-                    emit_draft_block8();
-                } else {
-                    INK_CK(cudaGraphLaunch(draft_graph, r.st));
-                }
-            } else {
-                INK_CK(cudaGraphLaunch(draft_graph, r.st));
+                INK_CK(cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal));
+                emit_draft_block8();
+                INK_CK(cudaStreamEndCapture(r.st, &gr));
+                INK_CK(cudaGraphInstantiate(&draft_graph, gr, nullptr, nullptr, 0));
+                INK_CK(cudaGraphDestroy(gr));
             }
+            INK_CK(cudaGraphLaunch(draft_graph, r.st));
         } else {
             emit_draft_block8();
         }
@@ -1695,7 +1580,7 @@ struct InkDSpark {
 
     // Draft True W=2..4 Multi-Branch Bayes-Optimal Connected Tree (M <= 16..32 nodes, CUDA Graph captured!)
     // When adaptive_moe_ratio > 0, dynamically picks M* in {4, 6, 8, 10, 12, 16} maximizing E[emit(M)] / (1 + ratio*(1-(15/16)^M))!
-    void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f, float plain_margin = 0.0f) {
+    void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f) {
         beam_w = std::max(1, std::min(kInkMaxBeam, beam_w));
         max_nodes = std::max(2, std::min(r.tree_cap, max_nodes));
         const int B = kInkDsparkBlock;  // 8
@@ -1710,27 +1595,14 @@ struct InkDSpark {
             if (!beam_graph || beam_graph_w != beam_w) {
                 if (beam_graph) { cudaGraphExecDestroy(beam_graph); beam_graph = nullptr; }
                 cudaGraph_t gr = nullptr;
-                cudaError_t ce = cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal);
-                if (ce == cudaSuccess) {
-                    emit_draft_beam_tree(beam_w);
-                    ce = cudaStreamEndCapture(r.st, &gr);
-                    if (ce == cudaSuccess && gr) {
-                        ce = cudaGraphInstantiate(&beam_graph, gr, nullptr, nullptr, 0);
-                        cudaGraphDestroy(gr);
-                    }
-                }
-                if (ce != cudaSuccess || !beam_graph) {
-                    (void)cudaGetLastError();
-                    if (beam_graph) { cudaGraphExecDestroy(beam_graph); beam_graph = nullptr; }
-                    r.use_cuda_graph = false;
-                    emit_draft_beam_tree(beam_w);
-                } else {
-                    beam_graph_w = beam_w;
-                    INK_CK(cudaGraphLaunch(beam_graph, r.st));
-                }
-            } else {
-                INK_CK(cudaGraphLaunch(beam_graph, r.st));
+                INK_CK(cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal));
+                emit_draft_beam_tree(beam_w);
+                INK_CK(cudaStreamEndCapture(r.st, &gr));
+                INK_CK(cudaGraphInstantiate(&beam_graph, gr, nullptr, nullptr, 0));
+                INK_CK(cudaGraphDestroy(gr));
+                beam_graph_w = beam_w;
             }
+            INK_CK(cudaGraphLaunch(beam_graph, r.st));
         } else {
             emit_draft_beam_tree(beam_w);
         }
@@ -1754,7 +1626,7 @@ struct InkDSpark {
         int want = std::min(max_nodes, cnt);
         if (adaptive_moe_ratio > 0.0f) {
             // Exact Sparse-MoE Bayes-Optimal Dynamic Tree Sizing across cached CUDA Graph buckets {3, 4, 5, 6, 8, 10, 12}!
-            static constexpr int kBuckets[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16};
+            static constexpr int kBuckets[] = {3, 4, 5, 6, 8, 10, 12, 16};
             double pref_p[kInkBeamPoolCap + 1];
             pref_p[0] = 1.0;  // root always emits 1 token
             for (int i = 0; i < n_cand; ++i) {
@@ -1765,17 +1637,13 @@ struct InkDSpark {
             int best_m = std::min(3, cnt);
             for (int mb : kBuckets) {
                 if (mb > max_nodes || mb > cnt) continue;
-                if (mb < 3 && plain_margin <= 0.0f) continue;  // the 1 and 2 node trees exist only when the caller lets the step fall back to plain decoding
                 const double e_tok = pref_p[mb - 1];
                 const double exp_frac = 1.0 - std::pow(15.0 / 16.0, (double)mb);
                 const double cost = 1.0 + (double)adaptive_moe_ratio * exp_frac;
-                double rate = e_tok / cost;
-                if (mb < 3) rate *= (double)plain_margin;
+                const double rate = e_tok / cost;
                 if (rate > best_rate) { best_rate = rate; best_m = mb; }
             }
             want = best_m;
-            last_pred_etok = pref_p[best_m - 1];
-            last_m = best_m;
         }
 
         uint8_t keep[kInkBeamPoolCap] = {};
