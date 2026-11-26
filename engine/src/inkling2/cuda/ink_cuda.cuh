@@ -16,28 +16,29 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-// MERGED from kuraneko1/Strata (MIT, kuraneko1/_ryu15_): two-axis SM x VRAM
-// automatic profile selection. Credit: kuraneko1 (_ryu15_), kuraneko1/Strata (MIT).
-#include "strata/inkling2/profile_rules.hpp"
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
-#include <stdexcept>
-#include <string>
-#include "strata/core/device_error_exit.hpp"
-#include "strata/platform/cgroup_mem.hpp"
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #define INK_CK(call)                                                                                                  \
     do {                                                                                                              \
         cudaError_t _e = (call);                                                                                      \
         if (_e != cudaSuccess) {                                                                                      \
-            char _what[256];                                                                                          \
-            std::snprintf(_what, sizeof(_what), "strata-inkling CUDA error %d at %s:%d", (int)_e, __FILE__, __LINE__);\
-            strata::core::exit_device_error(_what, cudaGetErrorString(_e));                                           \
+            std::fprintf(stderr, "strata-inkling CUDA error %d (%s) at %s:%d\n", (int)_e, cudaGetErrorString(_e),     \
+                         __FILE__, __LINE__);                                                                         \
+            std::exit(3);                                                                                             \
         }                                                                                                             \
     } while (0)
 
@@ -45,9 +46,8 @@
     do {                                                                                                              \
         cublasStatus_t _s = (call);                                                                                   \
         if (_s != CUBLAS_STATUS_SUCCESS) {                                                                            \
-            char _what[256];                                                                                          \
-            std::snprintf(_what, sizeof(_what), "strata-inkling cuBLAS error %d at %s:%d", (int)_s, __FILE__, __LINE__); \
-            strata::core::exit_device_error(_what, "cublas error");                                                   \
+            std::fprintf(stderr, "strata-inkling cuBLAS error %d at %s:%d\n", (int)_s, __FILE__, __LINE__);           \
+            std::exit(3);                                                                                             \
         }                                                                                                             \
     } while (0)
 
@@ -57,35 +57,10 @@ inline double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// A device allocation that did not fit. While start-up code runs with ink_alloc_throws() set (the backend's init), a failed
-// allocation throws this so the backend can retry with a smaller workspace (#6644 #6792); everywhere else it ends the engine
-// the way every other CUDA error does.
-struct InkAllocFailure : std::runtime_error {
-    explicit InkAllocFailure(const std::string& m) : std::runtime_error(m) {}
-};
-inline bool& ink_alloc_throws() {
-    static thread_local bool v = false;
-    return v;
-}
-// Names the request and the card's free memory ("CUDA error 2 at ink_cuda.cuh:54" alone cannot be acted on).
-inline void ink_alloc_failed(cudaError_t e, size_t bytes, const char* file, int line) {
-    size_t vf = 0, vt = 0;
-    cudaGetLastError();
-    cudaMemGetInfo(&vf, &vt);
-    char _what[300];
-    std::snprintf(_what, sizeof(_what), "strata-inkling CUDA error %d at %s:%d (allocating %.0f MiB; %.0f of %.0f MiB free)",
-                  (int)e, file, line, (double)bytes / 1048576.0, (double)vf / 1048576.0, (double)vt / 1048576.0);
-    if (ink_alloc_throws()) throw InkAllocFailure(_what);
-    strata::core::exit_device_error(_what, cudaGetErrorString(e));
-}
-
 template <typename T>
 inline T* dalloc(size_t count) {
     T* p = nullptr;
-    if (count > 0) {
-        const cudaError_t e = cudaMalloc(&p, count * sizeof(T));
-        if (e != cudaSuccess) ink_alloc_failed(e, count * sizeof(T), __FILE__, __LINE__);
-    }
+    if (count > 0) INK_CK(cudaMalloc(&p, count * sizeof(T)));
     return p;
 }
 
@@ -108,31 +83,62 @@ inline int current_sm_arch(int dev = 0) {
     return cached_sm;
 }
 
-// MERGED from kuraneko1/Strata (MIT): select the measured SM x VRAM profile for
-// this GPU. Returns a pure-C++ table entry (no CUDA dependency in its own TU);
-// unmeasured cards take the conservative Generic defaults. Explicit CLI flags /
-// env overrides still win at the caller, per Strata's measured-only rule.
-inline strata::inkling2::ArchProfile current_arch_profile(int dev = 0) {
-    const int sm = current_sm_arch(dev);
-    if (sm <= 0) return strata::inkling2::select_arch_profile(0, 0);
-    const int major = sm / 10, minor = sm % 10;
-    return strata::inkling2::select_arch_profile(major, minor);
-}
+#if defined(_WIN32)
+struct InkNvmlMemory {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
 
-// Unified-Memory-safe VRAM query: on Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA),
-// cudaMemGetInfo subtracts reclaimable OS page cache (like the 19 GB .strata file just read!),
-// so take max(cuda_free, /proc/meminfo MemAvailable) to prevent false hybrid spill!
-inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) {
-    // #7093: cudaMemGetInfo answers for the CURRENT device, so `dev` has to be made current for the call: the layer split asked for
-    // a peer card's memory while the primary card was current and got the primary's, so the peer's expert budget was far too small
-    // (an RTX 3060 pair, SQ-20: the peer was budgeted 7.2 GiB with 10.8 GiB free), and its overflow became host experts it cannot compute.
-    int prev_dev = -1;
-    if (dev >= 0) {
-        int cur_dev = -1;
-        if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev != dev && cudaSetDevice(dev) == cudaSuccess) prev_dev = cur_dev;
+// On Windows WDDM, cudaMemGetInfo() artificially caps reported free VRAM at WDDM's conservative
+// per-process LocalBudget (~90% of physical VRAM, hiding ~550-750 MiB of real dedicated VRAM on 8 GB GPUs).
+// Query NVML (nvml.dll, shipped with the NVIDIA display driver) for true physical free VRAM!
+inline bool ink_nvml_mem_info(int cuda_dev, size_t* vfree_out, size_t* vtot_out) {
+    using nvmlInit_t     = int (*)();
+    using nvmlGetByPci_t = int (*)(const char*, void**);
+    using nvmlGetByIdx_t = int (*)(unsigned int, void**);
+    using nvmlGetMem_t   = int (*)(void*, InkNvmlMemory*);
+    static bool tried = false;
+    static nvmlGetByPci_t fn_pci = nullptr;
+    static nvmlGetByIdx_t fn_idx = nullptr;
+    static nvmlGetMem_t   fn_mem = nullptr;
+    if (!tried) {
+        tried = true;
+        HMODULE mod = LoadLibraryA("nvml.dll");
+        if (mod) {
+            auto fn_init = reinterpret_cast<nvmlInit_t>(GetProcAddress(mod, "nvmlInit_v2"));
+            if (fn_init && fn_init() == 0) {
+                fn_pci = reinterpret_cast<nvmlGetByPci_t>(GetProcAddress(mod, "nvmlDeviceGetHandleByPciBusId_v2"));
+                fn_idx = reinterpret_cast<nvmlGetByIdx_t>(GetProcAddress(mod, "nvmlDeviceGetHandleByIndex_v2"));
+                fn_mem = reinterpret_cast<nvmlGetMem_t>(GetProcAddress(mod, "nvmlDeviceGetMemoryInfo"));
+            }
+        }
     }
+    if (!fn_mem) return false;
+    void* handle = nullptr;
+    char pci[64] = {};
+    if (fn_pci && cudaDeviceGetPCIBusId(pci, (int)sizeof(pci), cuda_dev) == cudaSuccess) {
+        if (fn_pci(pci, &handle) != 0) handle = nullptr;
+    }
+    if (!handle && fn_idx) {
+        if (fn_idx((unsigned int)cuda_dev, &handle) != 0) handle = nullptr;
+    }
+    if (!handle) return false;
+    InkNvmlMemory mem{};
+    if (fn_mem(handle, &mem) != 0 || mem.total == 0) return false;
+    *vfree_out = (size_t)mem.free;
+    *vtot_out  = (size_t)mem.total;
+    return true;
+}
+#endif
+
+// Unified-Memory-safe & Windows-WDDM-accurate VRAM query:
+// - On Linux integrated GPUs (e.g. DGX Spark GB10 sm_121 128 GB UMA), cudaMemGetInfo subtracts reclaimable
+//   OS page cache, so take max(cuda_free, /proc/meminfo MemAvailable).
+// - On Windows WDDM, cudaMemGetInfo hides ~550-750 MiB below physical VRAM; query nvml.dll so hybrid packing
+//   and post-init promo ring can utilize the full dedicated VRAM cleanly!
+inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) {
     cudaError_t ce = cudaMemGetInfo(vfree, vtot);
-    if (prev_dev >= 0) cudaSetDevice(prev_dev);
     if (ce != cudaSuccess) return ce;
 #if defined(__linux__)
     int cur = dev;
@@ -146,16 +152,19 @@ inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) 
                 unsigned long long kb = 0;
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
                     size_t avail = (size_t)kb * 1024ull;
-                    const auto cg = strata::platform::cgroup_mem::probe_cgroup_room((uint64_t)*vtot);
-                    if (cg.limited && cg.available_bytes != strata::platform::cgroup_mem::kUnlimited) {
-                        avail = std::min<size_t>(avail, (size_t)cg.available_bytes);
-                    }
                     if (avail > *vfree) *vfree = std::min(avail, *vtot);
                     break;
                 }
             }
             std::fclose(f);
         }
+    }
+#elif defined(_WIN32)
+    int cur = dev;
+    if (cur < 0) cudaGetDevice(&cur);
+    size_t nv_free = 0, nv_tot = 0;
+    if (ink_nvml_mem_info(cur, &nv_free, &nv_tot)) {
+        if (nv_free > *vfree) *vfree = std::min(nv_free, *vtot);
     }
 #else
     (void)dev;
@@ -215,13 +224,10 @@ enum InkFmt : int {
     FMT_S8_K  = 8,
     FMT_SF4   = 15,
     FMT_MX8   = 16,
-    FMT_GGUF_RAW = 20,
     FMT_Q8ROW = 100,
     FMT_F32   = 101,
     FMT_BF16  = 102,
     FMT_F16   = 103,
-    FMT_Q8_0  = 104,   // GGUF Q8_0 table as stored, row by row: [N][K/32] fp16 scales, then [N][K] int8 (the embedding; CUDA backend only)
-    FMT_Q8_0F = 105,   // GGUF Q8_0 dense matrix in mma fragment order for k_ink_gemm_q8f (CUDA, sm_80+): see the loader
 };
 
 __host__ __device__ constexpr int ink_sb_bytes(int fmt) {
@@ -378,11 +384,9 @@ __device__ __forceinline__ float ue8m0_to_f32(uint8_t e) {
     return __uint_as_float((uint32_t)e << 23);
 }
 
-// Exact SITU(beta=4.0, lb=25.0) double-softcapped MoE activation (non-finite guard prevents NaN propagation!)
+// Exact SITU(beta=4.0, lb=25.0) double-softcapped MoE activation
 __device__ __forceinline__ float situ_f32(float g, float u) {
-    if (!isfinite(g) || !isfinite(u)) return 0.0f;
-    const float gc = fminf(fmaxf(g, -80.0f), 80.0f);
-    const float sig = 1.0f / (1.0f + __expf(-gc));
+    const float sig = 1.0f / (1.0f + __expf(-g));
     const float ga = kInkSituBeta * tanhf(g * (1.0f / kInkSituBeta)) * sig;
     const float ua = kInkSituLb * tanhf(u * (1.0f / kInkSituLb));
     return ga * ua;
